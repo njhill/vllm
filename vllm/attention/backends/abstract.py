@@ -95,6 +95,9 @@ class AttentionMetadata:
             for field in fields(self) if field.name not in skip_fields
         }
 
+    def values_list(self) -> List[Any]:
+        return [getattr(self, field.name) for field in fields(self)]
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 

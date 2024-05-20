@@ -9,7 +9,7 @@ from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          VisionLanguageConfig)
-from vllm.distributed import (broadcast_tensor_dict, graph_capture,
+from vllm.distributed import (broadcast_tensor_list, graph_capture,
                               register_broadcast_callsite)
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
@@ -621,40 +621,33 @@ class ModelRunner:
                 seq_group_metadata_list, seq_lens, query_lens, self.device,
                 self.pin_memory)
 
-            metadata_dict = {
-                "input_tokens": input_tokens,
-                "input_positions": input_positions,
-                "selected_token_indices":
+            metadata_list = [
+                input_tokens,
+                input_positions,
                 sampling_metadata.selected_token_indices,
-                "lora_requests": lora_requests,
-                "lora_mapping": lora_mapping,
-                "multi_modal_input": multi_modal_input,
-                "num_prefill_tokens": num_prefill_tokens,
-                "num_decode_tokens": num_decode_tokens,
-                "slot_mapping": slot_mapping,
-                "num_prefills": num_prefills,
-            }
+                lora_requests,
+                lora_mapping,
+                multi_modal_input,
+            ]
             if attn_metadata:
-                metadata_dict.update(attn_metadata.asdict_zerocopy())
-            broadcast_tensor_dict(
-                metadata_dict,
+                metadata_list.extend(attn_metadata.values_list())
+            broadcast_tensor_list(
+                metadata_list,
                 src=0,
                 callsite_id=self.prepare_input_tensors_callsite_id)
         else:
-            metadata_dict = broadcast_tensor_dict(
+            metadata_list = broadcast_tensor_list(
                 src=0, callsite_id=self.prepare_input_tensors_callsite_id)
-            input_tokens = metadata_dict.pop("input_tokens")
-            input_positions = metadata_dict.pop("input_positions")
-            selected_token_indices = metadata_dict.pop(
-                "selected_token_indices")
-            lora_mapping = metadata_dict.pop("lora_mapping")
-            lora_requests = metadata_dict.pop("lora_requests")
-            multi_modal_input = metadata_dict.pop("multi_modal_input")
-            if metadata_dict:
-                attn_metadata = self.attn_backend.make_metadata(
-                    **metadata_dict)
-            else:
-                attn_metadata = None
+            (
+                input_tokens,
+                input_positions,
+                selected_token_indices,
+                lora_requests,
+                lora_mapping,
+                multi_modal_input,
+            ) = metadata_list[:6]
+            attn_metadata = None if len(metadata_list) == 6 else \
+                self.attn_backend.make_metadata(*metadata_list[6:])
             sampling_metadata = SamplingMetadata(
                 seq_groups=None,
                 selected_token_indices=selected_token_indices,

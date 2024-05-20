@@ -1,7 +1,7 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed
@@ -9,7 +9,7 @@ import torch.distributed
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          SpeculativeConfig, VisionLanguageConfig)
-from vllm.distributed import (broadcast_tensor_dict,
+from vllm.distributed import (broadcast_tensor_list,
                               ensure_model_parallel_initialized,
                               init_distributed_environment,
                               register_broadcast_callsite,
@@ -259,19 +259,15 @@ class Worker(WorkerBase):
             blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
                                           device=self.device,
                                           dtype=torch.int64).view(-1, 2)
-            data: Dict[str, Any] = {
-                "num_seq_groups": num_seq_groups,
-                "blocks_to_swap_in": blocks_to_swap_in,
-                "blocks_to_swap_out": blocks_to_swap_out,
-                "blocks_to_copy": blocks_to_copy,
-            }
-            broadcast_tensor_dict(data, src=0, callsite_id=callsite_id)
+            data = [
+                num_seq_groups, blocks_to_swap_in, blocks_to_swap_out,
+                blocks_to_copy
+            ]
+            broadcast_tensor_list(data, src=0, callsite_id=callsite_id)
         else:
-            data = broadcast_tensor_dict(src=0, callsite_id=callsite_id)
-            num_seq_groups = data["num_seq_groups"]
-            blocks_to_swap_in = data["blocks_to_swap_in"]
-            blocks_to_swap_out = data["blocks_to_swap_out"]
-            blocks_to_copy = data["blocks_to_copy"]
+            data = broadcast_tensor_list(src=0, callsite_id=callsite_id)
+            (num_seq_groups, blocks_to_swap_in, blocks_to_swap_out,
+             blocks_to_copy) = data
 
         self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 

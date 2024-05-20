@@ -3,6 +3,7 @@ import struct
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -196,28 +197,25 @@ def broadcast_object_list(obj_list: List[Any],
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
-def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+def _split_object_tensor_list(
+    object_list: List[Union[torch.Tensor, Any]]
 ) -> Tuple[List[Any], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
-    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
-         by its metadata.
+    1. The input list with tensors replaced by its metadata.
     2. A list of tensors.
     """
     metadata_list = []
     tensor_list = []
-    for key, value in tensor_dict.items():
+    for value in object_list:
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
             # because it contains not only the device type but also the device
             # index (e.g. "cuda:0"). We only need the device type.
             # receiving side will set the device index.
             device = "cpu" if value.is_cpu else "cuda"
-            metadata_list.append(
-                (key, TensorMetadata(device, value.dtype, value.size())))
             tensor_list.append(value)
-        else:
-            metadata_list.append((key, value))
+            value = TensorMetadata(device, value.dtype, value.size())
+        metadata_list.append(value)
     return metadata_list, tensor_list
 
 
@@ -247,19 +245,48 @@ def broadcast_tensor_dict(
     metadata_group: Optional[ProcessGroup] = None,
     callsite_id: int = 0,
 ) -> Optional[Dict[Any, Union[torch.Tensor, Any]]]:
+    """Broadcast the input list comprising tensors and/or other objects.
+    `group` is used to broadcast the tensors, while `metadata_group` is used
+     to broadcast the metadata of the list (e.g. tensor sizes, dtypes,
+     non-tensor objects).
+     `callsite_id` should be obtained for a particular call site by
+     calling register_broadcast_callsite().
+    """
+    if tensor_dict is not None:
+        assert isinstance(tensor_dict, dict), \
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        send_list = list(chain(tensor_dict.keys(), tensor_dict.values()))
+        broadcast_tensor_list(send_list, src, group, metadata_group,
+                              callsite_id)
+        return tensor_dict
+
+    recv_list = broadcast_tensor_list(None, src, group, metadata_group,
+                                      callsite_id)
+    assert recv_list is not None
+    count = len(recv_list) // 2
+    return {recv_list[i]: recv_list[count + i] for i in range(count)}
+
+
+def broadcast_tensor_list(
+    object_list: Optional[List[Union[torch.Tensor, Any]]] = None,
+    src: int = 0,
+    group: Optional[ProcessGroup] = None,
+    metadata_group: Optional[ProcessGroup] = None,
+    callsite_id: int = 0,
+) -> Optional[List[Union[torch.Tensor, Any]]]:
     """Broadcast the input tensor dictionary.
     `group` is used to broadcast the tensors, while `metadata_group` is used
      to broadcast the metadata of the dict (e.g. dict structure, tensor sizes,
      dtypes).
      `callsite_id` should be obtained for a particular call site by
-     calling register_broadcast_callsite()
+     calling register_broadcast_callsite().
     """
     group = group or torch.distributed.group.WORLD
 
     # Bypass the function if we are using only 1 GPU.
     if (not torch.distributed.is_initialized()
             or torch.distributed.get_world_size(group=group) == 1):
-        return tensor_dict
+        return object_list
 
     metadata_group = metadata_group or get_cpu_world_group()
     ranks = torch.distributed.get_process_group_ranks(group)
@@ -270,10 +297,8 @@ def broadcast_tensor_dict(
 
     rank = torch.distributed.get_rank()
     if rank == src:
-        assert isinstance(
-            tensor_dict,
-            dict), (f"Expecting a dictionary, got {type(tensor_dict)}")
-        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        assert isinstance(object_list, list)
+        metadata_list, tensor_list = _split_object_tensor_list(object_list)
         pickled = pickle.dumps(metadata_list)
         size = len(pickled) + 8
 
@@ -331,11 +356,11 @@ def broadcast_tensor_dict(
 
         recv_metadata = pickle.loads(BROADCAST_BUFFER[8:callsite_tensor_size])
 
-        tensor_dict = {}
+        object_list = []
         async_handles = []
-        for key, value in recv_metadata:
+        for value in recv_metadata:
             if not isinstance(value, TensorMetadata):
-                tensor_dict[key] = value
+                object_list.append(value)
                 continue
 
             tensor = torch.empty(value.size,
@@ -351,8 +376,8 @@ def broadcast_tensor_dict(
                     async_op=True)
                 async_handles.append(handle)
 
-            tensor_dict[key] = tensor
+            object_list.append(tensor)
 
         for async_handle in async_handles:
             async_handle.wait()
-    return tensor_dict
+    return object_list

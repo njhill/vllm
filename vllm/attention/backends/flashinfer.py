@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import flashinfer
@@ -137,6 +137,15 @@ class FlashInferMetadata(AttentionMetadata):
         # broadcasted with nccl when TP is enabled.
         skip_fields.add('decode_wrapper')
         return super().asdict_zerocopy(skip_fields)
+
+    def values_list(self) -> List[Any]:
+        # We need to skip the decode_wrapper field since it cannot be
+        # broadcasted with nccl when TP is enabled.
+        return [
+            getattr(self, field.name)
+            if field.name != 'decode_wrapper' else None
+            for field in fields(self)
+        ]
 
     @property
     def prefill_metadata(self) -> Optional["FlashInferMetadata"]:
