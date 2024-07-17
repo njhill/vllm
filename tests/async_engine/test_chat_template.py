@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import pytest
 
+from vllm.entrypoints.openai.chat_utils import load_chat_template
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 chatml_jinja_path = pathlib.Path(os.path.dirname(os.path.abspath(
@@ -62,8 +62,7 @@ class MockServingChat:
 
 def test_load_chat_template():
     # Testing chatml template
-    template_content = OpenAIServingChat._load_chat_template(
-        chat_template=chatml_jinja_path)
+    template_content = load_chat_template(chat_template=chatml_jinja_path)
 
     # Test assertions
     assert template_content is not None
@@ -77,15 +76,14 @@ def test_no_load_chat_template_filelike():
     template = "../../examples/does_not_exist"
 
     with pytest.raises(ValueError, match="looks like a file path"):
-        OpenAIServingChat._load_chat_template(chat_template=template)
+        load_chat_template(chat_template=template)
 
 
 def test_no_load_chat_template_literallike():
     # Testing chatml template
     template = "{{ messages }}"
 
-    template_content = OpenAIServingChat._load_chat_template(
-        chat_template=template)
+    template_content = load_chat_template(chat_template=template)
 
     assert template_content == template
 
@@ -97,8 +95,7 @@ def test_get_gen_prompt(model, template, add_generation_prompt,
                         expected_output):
     # Initialize the tokenizer
     tokenizer = get_tokenizer(tokenizer_name=model)
-    template_content = OpenAIServingChat._load_chat_template(
-        chat_template=template)
+    template_content = load_chat_template(chat_template=template)
 
     # Create a mock request object using keyword arguments
     mock_request = ChatCompletionRequest(

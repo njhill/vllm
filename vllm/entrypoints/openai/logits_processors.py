@@ -17,7 +17,7 @@ class AllowedTokenIdsLogitsProcessor:
     def __call__(self, token_ids: List[int],
                  logits: torch.Tensor) -> torch.Tensor:
         if self.mask is None:
-            self.mask = torch.full((logits.shape[-1],),
+            self.mask = torch.full((logits.shape[-1], ),
                                    True,
                                    dtype=torch.bool,
                                    device=logits.device)
