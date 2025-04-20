@@ -5,7 +5,7 @@ import msgspec.msgpack
 import zmq
 from zmq import Frame
 
-from vllm.utils import get_open_zmq_ipc_path, make_zmq_socket
+from vllm.utils import make_zmq_socket
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType)
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -25,9 +25,6 @@ class Router:
         # front_input_addr = get_open_zmq_ipc_path()
         # front_output_addr = get_open_zmq_ipc_path()
 
-        self.start_dp_msg = (EngineCoreRequestType.START_DP.value,
-                             msgspec.msgpack.encode(None))
-
         self.api_ids = [
             i.to_bytes(length=2, byteorder="little") for i in range(api_count)
         ]
@@ -40,7 +37,8 @@ class Router:
         # req_id -> (api_id, eng_id)
         self.reqs_in_flight: dict[str, tuple[bytes, bytes]] = {}
 
-        self.num_engines_running = 0
+        self.current_wave = 0
+        self.engines_running = False
 
     def process_input_socket(self, front_address: str, back_address: str,
                              inproc_path: str):
@@ -52,15 +50,15 @@ class Router:
         encoder = MsgpackEncoder()
 
         with make_zmq_socket(
-                path=front_address,
-                ctx=self.ctx,
-                socket_type=zmq.ROUTER,
-                bind=True,
+            path=front_address,
+            ctx=self.ctx,
+            socket_type=zmq.ROUTER,
+            bind=True,
         ) as input_front, make_zmq_socket(
-                path=back_address,
-                ctx=self.ctx,
-                socket_type=zmq.ROUTER,
-                bind=True,
+            path=back_address,
+            ctx=self.ctx,
+            socket_type=zmq.ROUTER,
+            bind=True,
         ) as input_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
 
             inproc_socket.bind(inproc_path)
@@ -70,16 +68,22 @@ class Router:
             while True:
                 socks = poller.poll()
                 if len(socks) == 2 or socks[0][0] == inproc_socket:
-                    wave = inproc_socket.recv()
-                    self.num_engines_running -= 1
-                    if not self.num_engines_running and self.reqs_in_flight:
-                        # If there are requests in flight here, they must have
-                        # been sent after the engines paused. We must make
-                        # sure to start the other engines:
-                        self.num_engines_running = len(self.eng_ids)
-                        for eng_id in self.eng_ids:
-                            input_back.send_multipart(
-                                (eng_id, ) + self.start_dp_msg, copy=False)
+                    data = inproc_socket.recv()
+                    wave = int.from_bytes(data[1:5], byteorder="little")
+                    if data[0] == b'c':
+                        if self.current_wave <= wave:
+                            self.current_wave = wave + 1
+                            self.engines_running = False
+                    elif wave is not None and (wave > self.current_wave or
+                                               (wave == self.current_wave
+                                                and not self.engines_running)):
+                        # Engine received request for a non-current wave so
+                        # we must ensure that other engines progress to the
+                        # next wave.
+                        self.current_wave = wave
+                        self.engines_running = True
+                        from_eng_id = data[5:7]
+                        self._send_start_wave(input_back, wave, from_eng_id)
                     continue
 
                 api_frame, type_frame, data_frame = input_front.recv_multipart(
@@ -94,6 +98,12 @@ class Router:
                     self.reqs_in_flight[request.request_id] = (api_id, eng_id)
                     input_back.send_multipart((eng_id, type_frame, data_frame),
                                               copy=False)
+                    if not self.engines_running:
+                        # Send dp start loop control message to all other
+                        # engines.
+                        self.engines_running = True
+                        self._send_start_wave(input_back, self.current_wave,
+                                              eng_id)
 
                 elif request_type == EngineCoreRequestType.UTILITY:
                     call_id, _, _ = generic_decoder.decode(data_frame.buffer)
@@ -133,6 +143,16 @@ class Router:
             input_back.send_multipart((eng_id, type_frame, encoded),
                                       copy=False)
 
+    def _send_start_wave(self, input_back: zmq.Socket, wave: int,
+                         excude_eng_id: bytes):
+        wave_encoded = msgspec.msgpack.encode(wave)
+        for eng_id in self.eng_ids:
+            if eng_id != excude_eng_id:
+                input_back.send_multipart(
+                    (eng_id, EngineCoreRequestType.START_DP_WAVE.value,
+                     wave_encoded),
+                    copy=False)
+
     def process_outputs_socket(self, front_address: str, back_address: str,
                                inproc_path: str):
         decoder = MsgpackDecoder(EngineCoreOutputs)
@@ -151,7 +171,7 @@ class Router:
         ) as output_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
 
             inproc_socket.connect(inproc_path)
-            api_outs = defaultdict(lambda: [])
+            api_outs = defaultdict(list)
             while True:
                 frame = output_back.recv(copy=False)
                 outputs: EngineCoreOutputs = decoder.decode(frame.buffer)
@@ -179,9 +199,14 @@ class Router:
                 for req_id in outputs.finished_requests or ():
                     self.reqs_in_flight.pop(req_id, None)
 
-                if outputs.engine_paused:
-                    # Notify input thread
-                    inproc_socket.send(b'')  # TODO send wave number
+                if outputs.wave_complete is not None or (outputs.start_wave
+                                                         is not None):
+                    # Notify input thread.
+                    prefix = b'c' if outputs.wave_complete is not None else b's'
+                    eng_id, _ = self.eng_ids[eng_index]
+                    wave = outputs.wave_complete.to_bytes(length=8,
+                                                          byteorder="little")
+                    inproc_socket.send(prefix + wave + eng_id, copy=False)
 
                 while api_outs:
                     api_index, out_list = api_outs.popitem()
