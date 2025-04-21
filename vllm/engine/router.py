@@ -15,7 +15,24 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 NONE_TUPLE = (None, None)
 
 
-class Router:
+class EngineRouter:
+
+    def __init__(self,
+                 parallel_config: ParallelConfig,
+                 api_server_count: int):
+
+        self.back_input_address, self.back_output_address = (
+            get_engine_zmq_addresses(parallel_config, False))
+
+    def get_engine_zmq_addresses(self):
+        return self.back_input_address, self.back_output_address
+
+
+    def run_engine_router_proc(self):
+
+
+
+class RouterProc:
 
     def __init__(self,
                  parallel_config: ParallelConfig,
@@ -184,15 +201,15 @@ class Router:
         encoder = MsgpackEncoder()
 
         with make_zmq_socket(
-                path=front_address,
-                ctx=self.ctx,
-                socket_type=zmq.ROUTER,
-                bind=True,
+            path=front_address,
+            ctx=self.ctx,
+            socket_type=zmq.ROUTER,
+            bind=True,
         ) as output_front, make_zmq_socket(
-                path=back_address,
-                ctx=self.ctx,
-                socket_type=zmq.PULL,
-                bind=True,
+            path=back_address,
+            ctx=self.ctx,
+            socket_type=zmq.PULL,
+            bind=True,
         ) as output_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
 
             inproc_socket.connect(inproc_path)

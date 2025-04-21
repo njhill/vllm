@@ -356,57 +356,12 @@ class MPClient(EngineCoreClient):
         self._finalizer = weakref.finalize(self, self.resources)
         success = False
         try:
-            parallel_config = vllm_config.parallel_config
-            local_engine_count = parallel_config.data_parallel_size_local
-            start_index = parallel_config.data_parallel_rank
-            local_start_index = parallel_config.data_parallel_rank_local
+            self._init_engines_direct(vllm_config, executor_class, log_stats)
 
-            # SPMD mode is where there is an LLM instance per DP rank and
-            # one core engine per LLM, see
-            # examples/offline_inference/data_parallel.py.
-            spmd_mode = local_start_index is not None
-            if spmd_mode:
-                assert local_engine_count == 1
-                self.core_engines = [
-                    CoreEngine(index=local_start_index, local=True)
-                ]
-            else:
-                assert start_index == 0
-                local_start_index = 0
-                self.core_engines = [
-                    CoreEngine(index=i, local=(i < local_engine_count))
-                    for i in range(parallel_config.data_parallel_size)
-                ]
 
-            input_address, output_address = get_engine_zmq_addresses(
-                parallel_config, spmd_mode)
 
-            # Create input and output sockets.
-            self.input_socket = self.resources.input_socket = make_zmq_socket(
-                self.ctx, input_address, zmq.ROUTER, bind=True)
-            self.resources.output_socket = make_zmq_socket(
-                self.ctx, output_address, zmq.constants.PULL)
-
-            # Start local engines.
-            if local_engine_count:
-                # In server mode, start_index and local_start_index will
-                # both be 0.
-                self.resources.local_engine_manager = CoreEngineProcManager(
-                    EngineCoreProc.run_engine_core,
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                    input_address=input_address,
-                    on_head_node=True,
-                    local_engine_count=local_engine_count,
-                    start_index=start_index,
-                    local_start_index=local_start_index)
 
             self.core_engine = self.core_engines[0]
-
-            # Wait for engine core process(es) to start.
-            self._wait_for_engine_startup(output_address, parallel_config)
-
             self.utility_results: dict[int, AnyFuture] = {}
 
             # Request objects which may contain pytorch-allocated tensors
@@ -418,6 +373,58 @@ class MPClient(EngineCoreClient):
         finally:
             if not success:
                 self._finalizer()
+
+    def _init_engines_direct(self, vllm_config: VllmConfig,
+                             executor_class: type[Executor],
+                             log_stats: bool):
+        parallel_config = vllm_config.parallel_config
+        local_engine_count = parallel_config.data_parallel_size_local
+        start_index = parallel_config.data_parallel_rank
+        local_start_index = parallel_config.data_parallel_rank_local
+
+        # SPMD mode is where there is an LLM instance per DP rank and
+        # one core engine per LLM, see
+        # examples/offline_inference/data_parallel.py.
+        spmd_mode = local_start_index is not None
+        if spmd_mode:
+            assert local_engine_count == 1
+            self.core_engines = [
+                CoreEngine(index=local_start_index, local=True)
+            ]
+        else:
+            assert start_index == 0
+            local_start_index = 0
+            self.core_engines = [
+                CoreEngine(index=i, local=(i < local_engine_count))
+                for i in range(parallel_config.data_parallel_size)
+            ]
+
+        input_address, output_address = get_engine_zmq_addresses(
+            parallel_config, spmd_mode)
+
+        # Create input and output sockets.
+        self.input_socket = self.resources.input_socket = make_zmq_socket(
+            self.ctx, input_address, zmq.ROUTER, bind=True)
+        self.resources.output_socket = make_zmq_socket(
+            self.ctx, output_address, zmq.constants.PULL)
+
+        # Start local engines.
+        if local_engine_count:
+            # In server mode, start_index and local_start_index will
+            # both be 0.
+            self.resources.local_engine_manager = CoreEngineProcManager(
+                EngineCoreProc.run_engine_core,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=log_stats,
+                input_address=input_address,
+                on_head_node=True,
+                local_engine_count=local_engine_count,
+                start_index=start_index,
+                local_start_index=local_start_index)
+
+        # Wait for engine core process(es) to start.
+        self._wait_for_engine_startup(output_address, parallel_config)
 
     def _wait_for_engine_startup(self, output_address: str,
                                  parallel_config: ParallelConfig):
