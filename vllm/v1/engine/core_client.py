@@ -28,7 +28,7 @@ from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
-from vllm.v1.utils import CoreEngineProcManager
+from vllm.v1.utils import CoreEngineProcManager, CoreEngine, wait_for_engine_startup, get_engine_zmq_addresses
 
 logger = init_logger(__name__)
 
@@ -262,16 +262,16 @@ class CoreEngineState(Enum):
     READY = auto()
 
 
-class CoreEngine:
-    """One per data parallel rank."""
-
-    def __init__(self, index: int = 0, local: bool = True):
-        self.local = local
-        self.index = index
-        self.identity = index.to_bytes(length=2, byteorder="little")
-
-        self.state = CoreEngineState.NEW
-        self.num_reqs_in_flight = 0
+# class CoreEngine:
+#     """One per data parallel rank."""
+#
+#     def __init__(self, index: int = 0, local: bool = True):
+#         self.local = local
+#         self.index = index
+#         self.identity = index.to_bytes(length=2, byteorder="little")
+#
+#         self.state = CoreEngineState.NEW
+#         self.num_reqs_in_flight = 0
 
 
 @dataclass
@@ -378,15 +378,15 @@ class MPClient(EngineCoreClient):
                     for i in range(parallel_config.data_parallel_size)
                 ]
 
-            input_address, output_address = self._get_zmq_addresses(
+            input_address, output_address = get_engine_zmq_addresses(
                 parallel_config, spmd_mode)
 
             # Create input and output sockets.
             self.input_socket = self.resources.input_socket = make_zmq_socket(
                 self.ctx, input_address, zmq.ROUTER, bind=True)
-
             self.resources.output_socket = make_zmq_socket(
                 self.ctx, output_address, zmq.constants.PULL)
+
             # Start local engines.
             if local_engine_count:
                 # In server mode, start_index and local_start_index will
@@ -419,109 +419,16 @@ class MPClient(EngineCoreClient):
             if not success:
                 self._finalizer()
 
-    @staticmethod
-    def _get_zmq_addresses(parallel_config: ParallelConfig,
-                           spmd_mode: bool) -> tuple[str, str]:
-        """Returns (input_address, output_address)."""
-        dp_size = parallel_config.data_parallel_size
-        local_engine_count = parallel_config.data_parallel_size_local
-
-        if local_engine_count == dp_size or spmd_mode:
-            input_address = get_open_zmq_ipc_path()
-            output_address = get_open_zmq_ipc_path()
-        else:
-            host = parallel_config.data_parallel_master_ip
-            input_port = parallel_config.data_parallel_rpc_port
-            output_port = get_open_port()
-            input_address = get_tcp_uri(host, input_port)
-            output_address = get_tcp_uri(host, output_port)
-
-        return input_address, output_address
-
     def _wait_for_engine_startup(self, output_address: str,
                                  parallel_config: ParallelConfig):
-        # Get a sync handle to the socket which can be sync or async.
-        sync_input_socket = zmq.Socket.shadow(self.input_socket)
-
-        # Wait for engine core process(es) to send ready messages.
-        local_count = parallel_config.data_parallel_size_local
-        remote_count = len(self.core_engines) - local_count
-        # [local, remote] counts
-        conn_pending, start_pending = [local_count, remote_count], [0, 0]
-
-        poller = zmq.Poller()
-        poller.register(sync_input_socket, zmq.POLLIN)
-        proc_manager = self.resources.local_engine_manager
-        if proc_manager is not None:
-            for sentinel in proc_manager.sentinels():
-                poller.register(sentinel, zmq.POLLIN)
-        while any(conn_pending) or any(start_pending):
-            events = poller.poll(STARTUP_POLL_PERIOD_MS)
-            if not events:
-                if any(conn_pending):
-                    logger.debug(
-                        "Waiting for %d local, %d remote core engine proc(s) "
-                        "to connect.", *conn_pending)
-                if any(start_pending):
-                    logger.debug(
-                        "Waiting for %d local, %d remote core engine proc(s) "
-                        "to start.", *start_pending)
-                continue
-            if len(events) > 1 or events[0][0] != sync_input_socket:
-                # One of the local core processes exited.
-                finished = proc_manager.finished_procs(
-                ) if proc_manager else {}
-                raise RuntimeError("Engine core initialization failed. "
-                                   "See root cause above. "
-                                   f"Failed core proc(s): {finished}")
-
-            # Receive HELLO and READY messages from the input socket.
-            eng_identity, ready_msg_bytes = sync_input_socket.recv_multipart()
-            eng_index = int.from_bytes(eng_identity, byteorder="little")
-            engine = next(
-                (e for e in self.core_engines if e.identity == eng_identity),
-                None)
-            if engine is None:
-                raise RuntimeError(f"Message from engine with unexpected data "
-                                   f"parallel rank: {eng_index}")
-            msg = msgspec.msgpack.decode(ready_msg_bytes)
-            status, local = msg["status"], msg["local"]
-            if local != engine.local:
-                raise RuntimeError(f"{status} message from "
-                                   f"{'local' if local else 'remote'} "
-                                   f"engine {eng_index}, expected it to be "
-                                   f"{'local' if engine.local else 'remote'}")
-
-            if status == "HELLO" and engine.state == CoreEngineState.NEW:
-
-                # Send init message with DP config info.
-                init_message = self.encoder.encode({
-                    "output_socket_address": output_address,
-                    "parallel_config": {
-                        "data_parallel_master_ip":
-                        parallel_config.data_parallel_master_ip,
-                        "data_parallel_master_port":
-                        parallel_config.data_parallel_master_port,
-                        "data_parallel_size":
-                        parallel_config.data_parallel_size,
-                    },
-                })
-                sync_input_socket.send_multipart((eng_identity, *init_message),
-                                                 copy=False)
-                conn_pending[0 if local else 1] -= 1
-                start_pending[0 if local else 1] += 1
-                engine.state = CoreEngineState.CONNECTED
-            elif status == "READY" and (engine.state
-                                        == CoreEngineState.CONNECTED):
-                start_pending[0 if local else 1] -= 1
-                engine.state = CoreEngineState.READY
-            else:
-                raise RuntimeError(f"Unexpected {status} message for "
-                                   f"{'local' if local else 'remote'} engine "
-                                   f"{eng_index} in {engine.state} state.")
-
-            logger.debug("%s from %s core engine process %s.", status,
-                         "local" if local else "remote", eng_index)
+        wait_for_engine_startup(
+            # Get a sync handle to the socket which might be sync or async.
+            zmq.Socket.shadow(self.input_socket),
+            output_address,
+            self.core_engines,
+            parallel_config,
+            self.resources.local_engine_manager
+        )
 
     def shutdown(self):
         # Terminate background resources.

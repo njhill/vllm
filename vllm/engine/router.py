@@ -5,6 +5,8 @@ import msgspec.msgpack
 import zmq
 from zmq import Frame
 
+from config import ParallelConfig
+from vllm.v1.utils import CoreEngine, wait_for_engine_startup, get_engine_zmq_addresses
 from vllm.utils import make_zmq_socket
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType)
@@ -15,21 +17,33 @@ NONE_TUPLE = (None, None)
 
 class Router:
 
-    def __init__(self):
+    def __init__(self,
+                 parallel_config: ParallelConfig,
+                 api_server_count: int):
 
         self.ctx = zmq.Context()
+        self.parallel_config = parallel_config
 
-        api_count = 4
-        engine_count = 4
+        engine_count = parallel_config.data_parallel_size
+        local_engine_count = parallel_config.data_parallel_size_local
+
+        self.output_address = ""  #TODO
 
         # front_input_addr = get_open_zmq_ipc_path()
         # front_output_addr = get_open_zmq_ipc_path()
 
+        back_input_address, back_output_address = get_engine_zmq_addresses(
+            parallel_config, False)
+
         self.api_ids = [
-            i.to_bytes(length=2, byteorder="little") for i in range(api_count)
+            i.to_bytes(length=2, byteorder="little")
+            for i in range(api_server_count)
         ]
-        self.eng_ids = [(i.to_bytes(2, byteorder="little"), [0, 0])
-                        for i in range(engine_count)]
+
+        self.engines = [
+            CoreEngine(index=i, local=(i < local_engine_count))
+            for i in range(engine_count)
+        ]
 
         # call_id -> api_id
         self.utility_pending: dict[int, bytes] = {}
@@ -39,6 +53,9 @@ class Router:
 
         self.current_wave = 0
         self.engines_running = False
+
+
+
 
     def process_input_socket(self, front_address: str, back_address: str,
                              inproc_path: str):
@@ -60,6 +77,14 @@ class Router:
             socket_type=zmq.ROUTER,
             bind=True,
         ) as input_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
+
+            wait_for_engine_startup(input_socket=input_back,
+                                    output_address=self.output_address,
+                                    core_engines=self.engines,
+                                    parallel_config=self.parallel_config,
+                                    proc_manager=None) #TODO
+
+            # TODO signal ready here
 
             inproc_socket.bind(inproc_path)
             poller = zmq.Poller()
@@ -108,9 +133,9 @@ class Router:
                 elif request_type == EngineCoreRequestType.UTILITY:
                     call_id, _, _ = generic_decoder.decode(data_frame.buffer)
                     self.utility_pending[call_id] = api_id
-                    for eng_id in self.eng_ids:
+                    for eng in self.engines:
                         input_back.send_multipart(
-                            (eng_id, type_frame, data_frame), copy=False)
+                            (eng.identity, type_frame, data_frame), copy=False)
 
                 elif request_type == EngineCoreRequestType.ABORT:
                     self.handle_abort_request(input_back, type_frame,
@@ -118,7 +143,7 @@ class Router:
                                               encoder)
 
     def get_eng_id_for_request(self) -> bytes:
-        return min(self.eng_ids, key=lambda e: e[1])[0]
+        return min(self.engines, key=lambda e: e.request_counts[1]).identity
 
     def handle_abort_request(self, input_back: zmq.Socket, type_frame: Frame,
                              data_frame: Frame, decoder: MsgpackDecoder,
@@ -146,10 +171,10 @@ class Router:
     def _send_start_wave(self, input_back: zmq.Socket, wave: int,
                          excude_eng_id: bytes):
         wave_encoded = msgspec.msgpack.encode(wave)
-        for eng_id in self.eng_ids:
-            if eng_id != excude_eng_id:
+        for eng in self.engines:
+            if eng.identity != excude_eng_id:
                 input_back.send_multipart(
-                    (eng_id, EngineCoreRequestType.START_DP_WAVE.value,
+                    (eng.identity, EngineCoreRequestType.START_DP_WAVE.value,
                      wave_encoded),
                     copy=False)
 
@@ -186,7 +211,7 @@ class Router:
 
                 eng_index = outputs.engine_index
                 if outputs.scheduler_stats:
-                    _, stats = self.eng_ids[eng_index]
+                    stats = self.engines[eng_index].request_counts
                     stats[0] = outputs.scheduler_stats.num_waiting_reqs
                     stats[1] = outputs.scheduler_stats.num_running_reqs
 
@@ -203,7 +228,7 @@ class Router:
                                                          is not None):
                     # Notify input thread.
                     prefix = b'c' if outputs.wave_complete is not None else b's'
-                    eng_id, _ = self.eng_ids[eng_index]
+                    eng_id = self.engines[eng_index].identity
                     wave = outputs.wave_complete.to_bytes(length=8,
                                                           byteorder="little")
                     inproc_socket.send(prefix + wave + eng_id, copy=False)
