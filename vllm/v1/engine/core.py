@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future
+from contextlib import ExitStack
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
@@ -558,27 +559,33 @@ class EngineCoreProc(EngineCore):
             logger.fatal("vLLM shutdown signal from EngineCore failed "
                          "to send. Please report this issue.")
 
-    def process_input_socket(self, input_socket: zmq.Socket):
+    def process_input_sockets(self, input_sockets: list[zmq.Socket]):
         """Input socket IO thread."""
 
         # Msgpack serialization decoding.
         add_request_decoder = MsgpackDecoder(EngineCoreRequest)
         generic_decoder = MsgpackDecoder()
 
+        poller = zmq.Poller()
+        for input_socket in input_sockets:
+            poller.register(input_socket, zmq.POLLIN)
+
         while True:
-            # (RequestType, RequestData)
-            type_frame, *data_frames = input_socket.recv_multipart(copy=False)
-            request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+            for input_socket, _ in poller.poll():
+                # (RequestType, RequestData)
+                type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
-            # Deserialize the request data.
-            decoder = add_request_decoder if (
-                request_type == EngineCoreRequestType.ADD) else generic_decoder
-            request = decoder.decode(data_frames)
+                # Deserialize the request data.
+                decoder = add_request_decoder if (
+                    request_type == EngineCoreRequestType.ADD) else generic_decoder
+                request = decoder.decode(data_frames)
 
-            # Push to input queue for core busy loop.
-            self.input_queue.put_nowait((request_type, request))
+                # Push to input queue for core busy loop.
+                # TODO maybe add frontend index
+                self.input_queue.put_nowait((request_type, request))
 
-    def process_output_socket(self, output_path: str, engine_index: int):
+    def process_output_socket(self, output_paths: list[str], engine_index: int):
         """Output socket IO thread."""
 
         # Msgpack serialization encoding.
@@ -592,14 +599,22 @@ class EngineCoreProc(EngineCore):
 
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
-        with zmq_socket_ctx(output_path, zmq.constants.PUSH,
-                            linger=4000) as socket:
+        with ExitStack() as stack:
+            sockets = [
+                stack.enter_context(zmq_socket_ctx(
+                    output_path, zmq.PUSH, linger=4000))
+                for output_path in output_paths
+            ]
+            max_reuse_bufs = len(sockets) + 1
+
             while True:
-                outputs = self.output_queue.get()
-                if outputs == EngineCoreProc.ENGINE_CORE_DEAD:
-                    socket.send(outputs, copy=False)
+                output = self.output_queue.get()
+                if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                    for socket in sockets:
+                        socket.send(output, copy=False)
                     break
-                assert not isinstance(outputs, bytes)
+                assert not isinstance(output, bytes)
+                outputs, client = output
                 outputs.engine_index = engine_index
 
                 # Reclaim buffers that zmq is finished with.
@@ -608,14 +623,14 @@ class EngineCoreProc(EngineCore):
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
-                tracker = socket.send_multipart(buffers,
+                tracker = sockets[client].send_multipart(buffers,
                                                 copy=False,
                                                 track=True)
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None
                     pending.appendleft((tracker, ref, buffer))
-                elif len(reuse_buffers) < 2:
-                    # Keep at most 2 buffers to reuse.
+                elif len(reuse_buffers) < max_reuse_bufs:
+                    # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
 
