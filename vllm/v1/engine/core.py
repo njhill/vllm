@@ -368,7 +368,8 @@ class EngineCoreProc(EngineCore):
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             self.input_queue = input_queue
-            self.output_queue = queue.Queue[Union[EngineCoreOutputs, bytes]]()
+            self.output_queue = (
+                queue.Queue[Union[tuple[int, EngineCoreOutputs], bytes]]())
             threading.Thread(target=self.process_input_socket,
                              args=(input_socket, ),
                              daemon=True).start()
@@ -515,7 +516,7 @@ class EngineCoreProc(EngineCore):
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
-            call_id, method_name, args = request
+            client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
             try:
                 method = getattr(self, method_name)
@@ -526,7 +527,7 @@ class EngineCoreProc(EngineCore):
                 output.failure_message = (f"Call to {method_name} method"
                                           f" failed: {str(e)}")
             self.output_queue.put_nowait(
-                EngineCoreOutputs(utility_output=output))
+                (client_idx, EngineCoreOutputs(utility_output=output)))
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:
@@ -573,19 +574,22 @@ class EngineCoreProc(EngineCore):
         while True:
             for input_socket, _ in poller.poll():
                 # (RequestType, RequestData)
-                type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                type_frame, *data_frames = input_socket.recv_multipart(
+                    copy=False)
                 request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
                 # Deserialize the request data.
                 decoder = add_request_decoder if (
-                    request_type == EngineCoreRequestType.ADD) else generic_decoder
+                    request_type
+                    == EngineCoreRequestType.ADD) else generic_decoder
                 request = decoder.decode(data_frames)
 
                 # Push to input queue for core busy loop.
                 # TODO maybe add frontend index
                 self.input_queue.put_nowait((request_type, request))
 
-    def process_output_socket(self, output_paths: list[str], engine_index: int):
+    def process_output_socket(self, output_paths: list[str],
+                              engine_index: int):
         """Output socket IO thread."""
 
         # Msgpack serialization encoding.
@@ -601,8 +605,8 @@ class EngineCoreProc(EngineCore):
         # message is sent prior to closing the socket.
         with ExitStack() as stack:
             sockets = [
-                stack.enter_context(zmq_socket_ctx(
-                    output_path, zmq.PUSH, linger=4000))
+                stack.enter_context(
+                    zmq_socket_ctx(output_path, zmq.PUSH, linger=4000))
                 for output_path in output_paths
             ]
             max_reuse_bufs = len(sockets) + 1
@@ -614,7 +618,7 @@ class EngineCoreProc(EngineCore):
                         socket.send(output, copy=False)
                     break
                 assert not isinstance(output, bytes)
-                outputs, client = output
+                client_index, outputs = output
                 outputs.engine_index = engine_index
 
                 # Reclaim buffers that zmq is finished with.
@@ -623,9 +627,9 @@ class EngineCoreProc(EngineCore):
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
-                tracker = sockets[client].send_multipart(buffers,
-                                                copy=False,
-                                                track=True)
+                tracker = sockets[client_index].send_multipart(buffers,
+                                                               copy=False,
+                                                               track=True)
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None
                     pending.appendleft((tracker, ref, buffer))

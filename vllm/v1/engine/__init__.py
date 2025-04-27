@@ -44,11 +44,8 @@ class EngineCoreRequest(
         omit_defaults=True,  # type: ignore[call-arg]
         gc=False):  # type: ignore[call-arg]
 
-    # NOTE: prompt and prompt_token_ids should be DecoderOnlyInput,
-    # but this object is currently not playing well with msgspec
-    # due to circular imports and typing we have in data.py
-
     request_id: str
+    client_index: int
     prompt_token_ids: list[int]
     mm_inputs: Optional[Sequence[Optional[MultiModalKwargs]]]
     mm_hashes: Optional[list[str]]

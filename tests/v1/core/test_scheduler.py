@@ -138,7 +138,6 @@ def create_requests(num_requests: int,
             multi_modal_placeholders=mm_position,
             multi_modal_hashes=None,
             eos_token_id=EOS_TOKEN_ID,
-            arrival_time=0,
         )
         requests.append(request)
     return requests

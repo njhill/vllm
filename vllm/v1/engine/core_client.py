@@ -358,9 +358,6 @@ class MPClient(EngineCoreClient):
         try:
             self._init_engines_direct(vllm_config, executor_class, log_stats)
 
-
-
-
             self.core_engine = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
 
@@ -375,8 +372,7 @@ class MPClient(EngineCoreClient):
                 self._finalizer()
 
     def _init_engines_direct(self, vllm_config: VllmConfig,
-                             executor_class: type[Executor],
-                             log_stats: bool):
+                             executor_class: type[Executor], log_stats: bool):
         parallel_config = vllm_config.parallel_config
         local_engine_count = parallel_config.data_parallel_size_local
         start_index = parallel_config.data_parallel_rank
@@ -405,8 +401,9 @@ class MPClient(EngineCoreClient):
         # Create input and output sockets.
         self.input_socket = self.resources.input_socket = make_zmq_socket(
             self.ctx, input_address, zmq.ROUTER, bind=True)
-        self.resources.output_socket = make_zmq_socket(
-            self.ctx, output_address, zmq.constants.PULL)
+        self.resources.output_socket = make_zmq_socket(self.ctx,
+                                                       output_address,
+                                                       zmq.PULL)
 
         # Start local engines.
         if local_engine_count:
@@ -434,8 +431,7 @@ class MPClient(EngineCoreClient):
             output_address,
             self.core_engines,
             parallel_config,
-            self.resources.local_engine_manager
-        )
+            self.resources.local_engine_manager)
 
     def shutdown(self):
         # Terminate background resources.

@@ -13,13 +13,14 @@ import msgspec
 import torch
 import zmq
 
-from vllm.v1.engine.core_client import CoreEngineState, STARTUP_POLL_PERIOD_MS
-from vllm.config import VllmConfig, ParallelConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
-from vllm.utils import get_mp_context, kill_process_tree, get_open_zmq_ipc_path, get_open_port, get_tcp_uri
+from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
+                        get_tcp_uri, kill_process_tree)
+from vllm.v1.engine.core_client import STARTUP_POLL_PERIOD_MS, CoreEngineState
 from vllm.v1.executor.abstract import Executor
 
 if TYPE_CHECKING:
@@ -182,8 +183,7 @@ class CoreEngine:
         self.request_counts = [0, 0]
 
 
-def wait_for_engine_startup(input_socket: zmq.Socket,
-                            output_address: str,
+def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
                             core_engines: list[CoreEngine],
                             parallel_config: ParallelConfig,
                             proc_manager: Optional[CoreEngineProcManager]):
@@ -213,8 +213,7 @@ def wait_for_engine_startup(input_socket: zmq.Socket,
             continue
         if len(events) > 1 or events[0][0] != input_socket:
             # One of the local core processes exited.
-            finished = proc_manager.finished_procs(
-            ) if proc_manager else {}
+            finished = proc_manager.finished_procs() if proc_manager else {}
             raise RuntimeError("Engine core initialization failed. "
                                "See root cause above. "
                                f"Failed core proc(s): {finished}")
@@ -222,8 +221,8 @@ def wait_for_engine_startup(input_socket: zmq.Socket,
         # Receive HELLO and READY messages from the input socket.
         eng_identity, ready_msg_bytes = input_socket.recv_multipart()
         eng_index = int.from_bytes(eng_identity, byteorder="little")
-        engine = next(
-            (e for e in core_engines if e.identity == eng_identity), None)
+        engine = next((e for e in core_engines if e.identity == eng_identity),
+                      None)
         if engine is None:
             raise RuntimeError(f"Message from engine with unexpected data "
                                f"parallel rank: {eng_index}")
@@ -242,20 +241,18 @@ def wait_for_engine_startup(input_socket: zmq.Socket,
                 "output_socket_address": output_address,
                 "parallel_config": {
                     "data_parallel_master_ip":
-                        parallel_config.data_parallel_master_ip,
+                    parallel_config.data_parallel_master_ip,
                     "data_parallel_master_port":
-                        parallel_config.data_parallel_master_port,
-                    "data_parallel_size":
-                        parallel_config.data_parallel_size,
+                    parallel_config.data_parallel_master_port,
+                    "data_parallel_size": parallel_config.data_parallel_size,
                 },
             })
             input_socket.send_multipart((eng_identity, *init_message),
-                                             copy=False)
+                                        copy=False)
             conn_pending[0 if local else 1] -= 1
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
-        elif status == "READY" and (engine.state
-                                    == CoreEngineState.CONNECTED):
+        elif status == "READY" and (engine.state == CoreEngineState.CONNECTED):
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
         else:

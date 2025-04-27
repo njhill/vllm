@@ -3,14 +3,15 @@ from collections import defaultdict
 
 import msgspec.msgpack
 import zmq
+from config import ParallelConfig
 from zmq import Frame
 
-from config import ParallelConfig
-from vllm.v1.utils import CoreEngine, wait_for_engine_startup, get_engine_zmq_addresses
 from vllm.utils import make_zmq_socket
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType)
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.utils import (CoreEngine, get_engine_zmq_addresses,
+                           wait_for_engine_startup)
 
 NONE_TUPLE = (None, None)
 
