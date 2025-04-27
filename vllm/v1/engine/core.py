@@ -191,16 +191,13 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids,
                                        RequestStatus.FINISHED_ABORTED)
 
-    def step(self) -> EngineCoreOutputs:
+    def step(self) -> dict[int, EngineCoreOutputs]:
         """Schedule, execute, and make output."""
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            return EngineCoreOutputs(
-                outputs=[],
-                scheduler_stats=self.scheduler.make_stats(),
-            )
+            return {}
         scheduler_output = self.scheduler.schedule()
         output = self.model_executor.execute_model(scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
@@ -208,7 +205,7 @@ class EngineCore:
 
         return engine_core_outputs
 
-    def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
+    def step_with_batch_queue(self) -> Optional[dict[int, EngineCoreOutputs]]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 
@@ -368,8 +365,9 @@ class EngineCoreProc(EngineCore):
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             self.input_queue = input_queue
-            self.output_queue = (
-                queue.Queue[Union[tuple[int, EngineCoreOutputs], bytes]]())
+            self.output_queue: queue.Queue[Union[tuple[int, EngineCoreOutputs],
+                                                 bytes]]
+            self.output_queue = queue.Queue()
             threading.Thread(target=self.process_input_socket,
                              args=(input_socket, ),
                              daemon=True).start()

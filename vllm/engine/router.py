@@ -18,9 +18,7 @@ NONE_TUPLE = (None, None)
 
 class EngineRouter:
 
-    def __init__(self,
-                 parallel_config: ParallelConfig,
-                 api_server_count: int):
+    def __init__(self, parallel_config: ParallelConfig, api_server_count: int):
 
         self.back_input_address, self.back_output_address = (
             get_engine_zmq_addresses(parallel_config, False))
@@ -28,16 +26,13 @@ class EngineRouter:
     def get_engine_zmq_addresses(self):
         return self.back_input_address, self.back_output_address
 
-
     def run_engine_router_proc(self):
-
+        pass  # TODO wip
 
 
 class RouterProc:
 
-    def __init__(self,
-                 parallel_config: ParallelConfig,
-                 api_server_count: int):
+    def __init__(self, parallel_config: ParallelConfig, api_server_count: int):
 
         self.ctx = zmq.Context()
         self.parallel_config = parallel_config
@@ -72,9 +67,6 @@ class RouterProc:
         self.current_wave = 0
         self.engines_running = False
 
-
-
-
     def process_input_socket(self, front_address: str, back_address: str,
                              inproc_path: str):
         """Input socket IO thread."""
@@ -85,22 +77,22 @@ class RouterProc:
         encoder = MsgpackEncoder()
 
         with make_zmq_socket(
-            path=front_address,
-            ctx=self.ctx,
-            socket_type=zmq.ROUTER,
-            bind=True,
+                path=front_address,
+                ctx=self.ctx,
+                socket_type=zmq.ROUTER,
+                bind=True,
         ) as input_front, make_zmq_socket(
-            path=back_address,
-            ctx=self.ctx,
-            socket_type=zmq.ROUTER,
-            bind=True,
+                path=back_address,
+                ctx=self.ctx,
+                socket_type=zmq.ROUTER,
+                bind=True,
         ) as input_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
 
             wait_for_engine_startup(input_socket=input_back,
                                     output_address=self.output_address,
                                     core_engines=self.engines,
                                     parallel_config=self.parallel_config,
-                                    proc_manager=None) #TODO
+                                    proc_manager=None)  #TODO
 
             # TODO signal ready here
 
@@ -202,15 +194,15 @@ class RouterProc:
         encoder = MsgpackEncoder()
 
         with make_zmq_socket(
-            path=front_address,
-            ctx=self.ctx,
-            socket_type=zmq.ROUTER,
-            bind=True,
+                path=front_address,
+                ctx=self.ctx,
+                socket_type=zmq.ROUTER,
+                bind=True,
         ) as output_front, make_zmq_socket(
-            path=back_address,
-            ctx=self.ctx,
-            socket_type=zmq.PULL,
-            bind=True,
+                path=back_address,
+                ctx=self.ctx,
+                socket_type=zmq.PULL,
+                bind=True,
         ) as output_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
 
             inproc_socket.connect(inproc_path)

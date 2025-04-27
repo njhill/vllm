@@ -742,12 +742,12 @@ class Scheduler(SchedulerInterface):
 
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
-            for client_index, outs in outputs
+            for client_index, outs in outputs.items()
         }
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids is not None:
-            for client_index, finished_set in finished_req_ids:
+            for client_index, finished_set in finished_req_ids.items():
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set
                 else:
@@ -807,7 +807,8 @@ class Scheduler(SchedulerInterface):
         self._cached_reqs_data.pop(request_id, None)
         del self.requests[request_id]
         self.finished_req_ids.add(request_id)
-        self.finished_req_ids_dict[request.client_index].add(request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].add(request_id)
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)

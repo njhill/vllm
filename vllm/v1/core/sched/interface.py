@@ -44,7 +44,7 @@ class SchedulerInterface(ABC):
         self,
         scheduler_output: "SchedulerOutput",
         model_runner_output: "ModelRunnerOutput",
-    ) -> "EngineCoreOutputs":
+    ) -> dict[int, "EngineCoreOutputs"]:
         """Update the scheduler state based on the model runner output.
 
         This method is called after the model runner has processed the scheduled

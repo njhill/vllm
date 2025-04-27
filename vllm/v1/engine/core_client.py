@@ -13,22 +13,21 @@ from enum import Enum, auto
 from threading import Thread
 from typing import Any, Callable, Optional, TypeVar, Union
 
-import msgspec
 import zmq
 import zmq.asyncio
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.utils import (get_open_port, get_open_zmq_inproc_path,
-                        get_open_zmq_ipc_path, get_tcp_uri, make_zmq_socket)
+from vllm.utils import get_open_zmq_inproc_path, make_zmq_socket
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType, UtilityOutput)
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
-from vllm.v1.utils import CoreEngineProcManager, CoreEngine, wait_for_engine_startup, get_engine_zmq_addresses
+from vllm.v1.utils import (CoreEngine, CoreEngineProcManager,
+                           get_engine_zmq_addresses, wait_for_engine_startup)
 
 logger = init_logger(__name__)
 
@@ -200,7 +199,7 @@ class InprocClient(EngineCoreClient):
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
-        return self.engine_core.step()
+        return self.engine_core.step().get(0) or EngineCoreOutputs()
 
     def add_request(self, request: EngineCoreRequest) -> None:
         self.engine_core.add_request(request)
