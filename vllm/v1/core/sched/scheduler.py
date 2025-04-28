@@ -623,6 +623,15 @@ class Scheduler(SchedulerInterface):
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
+    ) -> EngineCoreOutputs:
+        return self.update_from_output_multi_client(
+            scheduler_output, model_runner_output
+        ).get(0) or EngineCoreOutputs()
+
+    def update_from_output_multi_client(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         spec_token_ids = model_runner_output.spec_token_ids

@@ -200,7 +200,7 @@ class EngineCore:
             return {}
         scheduler_output = self.scheduler.schedule()
         output = self.model_executor.execute_model(scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
+        engine_core_outputs = self.scheduler.update_from_output_multi_client(
             scheduler_output, output)  # type: ignore
 
         return engine_core_outputs
@@ -247,7 +247,7 @@ class EngineCore:
             # Blocking until the first result is available.
             model_output = future.result()
             self.batch_queue.task_done()
-            engine_core_outputs = self.scheduler.update_from_output(
+            engine_core_outputs = self.scheduler.update_from_output_multi_client(
                 scheduler_output, model_output)
 
         return engine_core_outputs
@@ -365,9 +365,8 @@ class EngineCoreProc(EngineCore):
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             self.input_queue = input_queue
-            self.output_queue: queue.Queue[Union[tuple[int, EngineCoreOutputs],
-                                                 bytes]]
-            self.output_queue = queue.Queue()
+            self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
+                                                 bytes]]()
             threading.Thread(target=self.process_input_socket,
                              args=(input_socket, ),
                              daemon=True).start()
@@ -502,8 +501,9 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        if outputs is not None:
-            self.output_queue.put_nowait(outputs)
+        if outputs:
+            for output in outputs.items():
+                self.output_queue.put_nowait(output)
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
@@ -583,10 +583,9 @@ class EngineCoreProc(EngineCore):
                 request = decoder.decode(data_frames)
 
                 # Push to input queue for core busy loop.
-                # TODO maybe add frontend index
                 self.input_queue.put_nowait((request_type, request))
 
-    def process_output_socket(self, output_paths: list[str],
+    def process_output_sockets(self, output_paths: list[str],
                               engine_index: int):
         """Output socket IO thread."""
 

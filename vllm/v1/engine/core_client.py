@@ -559,7 +559,7 @@ class SyncMPClient(MPClient):
         future: Future[Any] = Future()
         self.utility_results[call_id] = future
         self._send_input(EngineCoreRequestType.UTILITY,
-                         (call_id, method, args))
+                         (0, call_id, method, args))
 
         return future.result()
 
@@ -627,6 +627,7 @@ class AsyncMPClient(MPClient):
             log_stats=log_stats,
         )
 
+        self.client_index = 0
         self.outputs_queue = asyncio.Queue[Union[EngineCoreOutputs,
                                                  Exception]]()
         try:
@@ -742,12 +743,13 @@ class AsyncMPClient(MPClient):
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
         message = (EngineCoreRequestType.UTILITY.value, *self.encoder.encode(
-            (call_id, method, args)))
+            (self.client_index, call_id, method, args)))
         await self._send_input_message(message, engine, args)
         self._ensure_output_queue_task()
         return await future
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
+        request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
 
@@ -826,6 +828,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.current_wave = self.current_wave
+        request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request()
         self.reqs_in_flight[request.request_id] = chosen_engine
