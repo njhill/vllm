@@ -104,16 +104,15 @@ class RouterProc:
             poller.register(output_back)
             last_publish = 0
             while True:
-                since = time.time() - last_publish
-                wait_for = 200 if
-                timeout = max(0, int((next_publish - time.time()) * 1000))
-                events = poller.poll(timeout=timeout)
+                elapsed = int(time.time() * 1000) - last_publish
+                wait_for = 200 if self.stats_changed else 3000
+                events = poller.poll(timeout=max(0, wait_for - elapsed))
                 if not events:
                     engine_list = self._get_engine_list()
                     to_publish = (engine_list, self.current_wave,
                                   self.engines_running)
                     publish_front.send(encoder.encode(to_publish))
-                    next_publish += 0.2 if self.engines_running else 3
+                    self.stats_changed = False
                     continue
 
                 if publish_front in events:
