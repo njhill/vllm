@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import time
 import weakref
 from collections import defaultdict
 from collections.abc import Sequence
 from multiprocessing import Process, connection
-from typing import (TYPE_CHECKING, Callable, Generic, Optional, TypeVar, Union,
-                    overload)
+from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar,
+                    Union, overload)
 
 import msgspec
 import torch
@@ -113,7 +112,7 @@ class CoreEngineProcManager:
         local_start_index: int,
         vllm_config: VllmConfig,
         on_head_node: bool,
-        input_address: str,
+        handshake_address: str,
         executor_class: type[Executor],
         log_stats: bool,
     ):
@@ -121,7 +120,7 @@ class CoreEngineProcManager:
         common_kwargs = {
             "vllm_config": vllm_config,
             "on_head_node": on_head_node,
-            "input_address": input_address,
+            "handshake_address": handshake_address,
             "executor_class": executor_class,
             "log_stats": log_stats,
         }
@@ -139,8 +138,7 @@ class CoreEngineProcManager:
                                     "local_dp_rank": local_index,
                                 }))
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes,
-                                           input_address)
+        self._finalizer = weakref.finalize(self, shutdown, self.processes)
         try:
             for proc in self.processes:
                 proc.start()
@@ -174,7 +172,7 @@ class CoreEngine:
     def __init__(self, index: int = 0, local: bool = True):
         self.local = local
         self.index = index
-        self.identity = index.to_bytes(length=2, byteorder="little")
+        self.identity = index.to_bytes(2, "little")
 
         self.state = CoreEngineState.NEW
 
@@ -183,7 +181,8 @@ class CoreEngine:
         self.request_counts = [0, 0]
 
 
-def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
+def wait_for_engine_startup(handshake_socket: zmq.Socket, addresses: dict[str,
+                                                                          Any],
                             core_engines: list[CoreEngine],
                             parallel_config: ParallelConfig,
                             proc_manager: Optional[CoreEngineProcManager]):
@@ -194,7 +193,7 @@ def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
     # [local, remote] counts
     conn_pending, start_pending = [local_count, remote_count], [0, 0]
     poller = zmq.Poller()
-    poller.register(input_socket, zmq.POLLIN)
+    poller.register(handshake_socket, zmq.POLLIN)
 
     if proc_manager is not None:
         for sentinel in proc_manager.sentinels():
@@ -211,7 +210,7 @@ def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
                     "Waiting for %d local, %d remote core engine proc(s) "
                     "to start.", *start_pending)
             continue
-        if len(events) > 1 or events[0][0] != input_socket:
+        if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
             finished = proc_manager.finished_procs() if proc_manager else {}
             raise RuntimeError("Engine core initialization failed. "
@@ -219,8 +218,8 @@ def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
                                f"Failed core proc(s): {finished}")
 
         # Receive HELLO and READY messages from the input socket.
-        eng_identity, ready_msg_bytes = input_socket.recv_multipart()
-        eng_index = int.from_bytes(eng_identity, byteorder="little")
+        eng_identity, ready_msg_bytes = handshake_socket.recv_multipart()
+        eng_index = int.from_bytes(eng_identity, "little")
         engine = next((e for e in core_engines if e.identity == eng_identity),
                       None)
         if engine is None:
@@ -238,7 +237,7 @@ def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
 
             # Send init message with DP config info.
             init_message = msgspec.msgpack.encode({
-                "output_socket_address": output_address,
+                "addresses": addresses,
                 "parallel_config": {
                     "data_parallel_master_ip":
                     parallel_config.data_parallel_master_ip,
@@ -247,8 +246,8 @@ def wait_for_engine_startup(input_socket: zmq.Socket, output_address: str,
                     "data_parallel_size": parallel_config.data_parallel_size,
                 },
             })
-            input_socket.send_multipart((eng_identity, *init_message),
-                                        copy=False)
+            handshake_socket.send_multipart((eng_identity, *init_message),
+                                            copy=False)
             conn_pending[0 if local else 1] -= 1
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
@@ -284,8 +283,8 @@ def get_engine_zmq_addresses(parallel_config: ParallelConfig,
 
 
 # Note(rob): shutdown function cannot be a bound method,
-# else the gc cannot collect the objedecoupct.
-def shutdown(procs: list[Process], input_address: str):
+# else the gc cannot collect the object.
+def shutdown(procs: list[Process]):
     # Shutdown the process.
     for proc in procs:
         if proc.is_alive():
@@ -303,12 +302,6 @@ def shutdown(procs: list[Process], input_address: str):
     for proc in procs:
         if proc.is_alive() and (pid := proc.pid) is not None:
             kill_process_tree(pid)
-
-    # Remove zmq ipc socket files.
-    if input_address.startswith("ipc://"):
-        socket_file = input_address[len("ipc://"):]
-        if os and os.path.exists(socket_file):
-            os.remove(socket_file)
 
 
 def bind_kv_cache(

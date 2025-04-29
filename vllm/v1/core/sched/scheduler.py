@@ -625,8 +625,8 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> EngineCoreOutputs:
         return self.update_from_output_multi_client(
-            scheduler_output, model_runner_output
-        ).get(0) or EngineCoreOutputs()
+            scheduler_output,
+            model_runner_output).get(0) or EngineCoreOutputs()
 
     def update_from_output_multi_client(
         self,
@@ -764,11 +764,10 @@ class Scheduler(SchedulerInterface):
                         finished_requests=finished_set)
             finished_req_ids.clear()
 
-        #TODO handle metrics in multi-client case
-        if not self.multi_client and engine_core_outputs:
-            assert len(outputs) == 1
-            engine_core_outputs[0].scheduler_stats = self.make_stats(
-                spec_decoding_stats)
+        if engine_core_outputs:
+            # Return stats to only one of the front-ends.
+            next(iter(engine_core_outputs.values())).scheduler_stats = (
+                self.make_stats(spec_decoding_stats))
 
         return engine_core_outputs
 

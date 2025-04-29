@@ -413,21 +413,26 @@ class MPClient(EngineCoreClient):
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=log_stats,
-                input_address=input_address,
+                handshake_address=input_address,
                 on_head_node=True,
                 local_engine_count=local_engine_count,
                 start_index=start_index,
                 local_start_index=local_start_index)
 
         # Wait for engine core process(es) to start.
-        self._wait_for_engine_startup(output_address, parallel_config)
+        self._wait_for_engine_startup(input_address, output_address,
+                                      parallel_config)
 
-    def _wait_for_engine_startup(self, output_address: str,
+    def _wait_for_engine_startup(self, input_address: str, output_address: str,
                                  parallel_config: ParallelConfig):
+        addresses = {
+            "input_address": input_address,
+            "output_address": output_address
+        }
         wait_for_engine_startup(
             # Get a sync handle to the socket which might be sync or async.
             zmq.Socket.shadow(self.input_socket),
-            output_address,
+            addresses,
             self.core_engines,
             parallel_config,
             self.resources.local_engine_manager)

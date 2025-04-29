@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-from collections import defaultdict
+import sys
+import time
+from typing import Optional
 
 import msgspec.msgpack
 import zmq
 from config import ParallelConfig
-from zmq import Frame
 
 from vllm.utils import make_zmq_socket
-from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
-                            EngineCoreRequestType)
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
-from vllm.v1.utils import (CoreEngine, get_engine_zmq_addresses,
-                           wait_for_engine_startup)
+from vllm.v1.utils import get_engine_zmq_addresses, wait_for_engine_startup
 
 NONE_TUPLE = (None, None)
 
@@ -30,9 +29,21 @@ class EngineRouter:
         pass  # TODO wip
 
 
+# Sockets:
+#   - Publish for balancing (rcv for new requests)
+#   -
+
+
+class EngineState:
+
+    def __init__(self):
+        # waiting, running
+        self.request_counts = [0, 0]
+
+
 class RouterProc:
 
-    def __init__(self, parallel_config: ParallelConfig, api_server_count: int):
+    def __init__(self, parallel_config: ParallelConfig):
 
         self.ctx = zmq.Context()
         self.parallel_config = parallel_config
@@ -48,45 +59,38 @@ class RouterProc:
         back_input_address, back_output_address = get_engine_zmq_addresses(
             parallel_config, False)
 
-        self.api_ids = [
-            i.to_bytes(length=2, byteorder="little")
-            for i in range(api_server_count)
-        ]
-
-        self.engines = [
-            CoreEngine(index=i, local=(i < local_engine_count))
-            for i in range(engine_count)
-        ]
-
-        # call_id -> api_id
-        self.utility_pending: dict[int, bytes] = {}
-
-        # req_id -> (api_id, eng_id)
-        self.reqs_in_flight: dict[str, tuple[bytes, bytes]] = {}
+        self.engines = [EngineState() for _ in range(engine_count)]
 
         self.current_wave = 0
         self.engines_running = False
+        self.stats_changed = False
 
     def process_input_socket(self, front_address: str, back_address: str,
                              inproc_path: str):
         """Input socket IO thread."""
 
-        # Msgpack serialization decoding.
-        add_request_decoder = MsgpackDecoder(EngineCoreRequest)
-        generic_decoder = MsgpackDecoder()
+        front_publish_address, front_input_address = front_address
+        back_publish_address, back_output_address = back_address
+
+        decoder = MsgpackDecoder(EngineCoreOutputs)
         encoder = MsgpackEncoder()
 
         with make_zmq_socket(
-                path=front_address,
+                path=front_publish_address,  # IPC
                 ctx=self.ctx,
-                socket_type=zmq.ROUTER,
+                socket_type=zmq.XPUB,
                 bind=True,
-        ) as input_front, make_zmq_socket(
-                path=back_address,
+        ) as publish_front, make_zmq_socket(
+                path=back_output_address,  # IPC or TCP
                 ctx=self.ctx,
-                socket_type=zmq.ROUTER,
+                socket_type=zmq.PULL,
                 bind=True,
-        ) as input_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
+        ) as output_back, make_zmq_socket(
+                path=back_publish_address,  # IPC or TCP
+                ctx=self.ctx,
+                socket_type=zmq.XPUB,
+                bind=True,
+        ) as publish_back:
 
             wait_for_engine_startup(input_socket=input_back,
                                     output_address=self.output_address,
@@ -95,158 +99,77 @@ class RouterProc:
                                     proc_manager=None)  #TODO
 
             # TODO signal ready here
-
-            inproc_socket.bind(inproc_path)
             poller = zmq.Poller()
-            poller.register(inproc_socket)
-            poller.register(input_front)
+            poller.register(publish_front)
+            poller.register(output_back)
+            last_publish = 0
             while True:
-                socks = poller.poll()
-                if len(socks) == 2 or socks[0][0] == inproc_socket:
-                    data = inproc_socket.recv()
-                    wave = int.from_bytes(data[1:5], byteorder="little")
-                    if data[0] == b'c':
+                since = time.time() - last_publish
+                wait_for = 200 if
+                timeout = max(0, int((next_publish - time.time()) * 1000))
+                events = poller.poll(timeout=timeout)
+                if not events:
+                    engine_list = self._get_engine_list()
+                    to_publish = (engine_list, self.current_wave,
+                                  self.engines_running)
+                    publish_front.send(encoder.encode(to_publish))
+                    next_publish += 0.2 if self.engines_running else 3
+                    continue
+
+                if publish_front in events:
+                    buffer = publish_front.recv()
+                    engine_index, wave = msgspec.msgpack.decode(buffer)
+                    if wave < self.current_wave:
+                        engine_index = None
+                    if not self.engines_running:
+                        self.engines_running = True
+                        self._send_start_wave(publish_back, self.current_wave,
+                                              engine_index)
+
+                if output_back in events:
+                    buffer = output_back.recv()
+                    outputs: EngineCoreOutputs = decoder.decode(buffer)
+
+                    assert outputs.outputs is None
+                    assert outputs.utility_output is None
+
+                    eng_index = outputs.engine_index
+                    if outputs.scheduler_stats:
+                        stats = self.engines[eng_index].request_counts
+                        stats[0] = outputs.scheduler_stats.num_waiting_reqs
+                        stats[1] = outputs.scheduler_stats.num_running_reqs
+                        self.stats_changed = True
+
+                        #TODO record prometheus metrics here?
+
+                    if outputs.wave_complete is not None:
                         if self.current_wave <= wave:
                             self.current_wave = wave + 1
                             self.engines_running = False
-                    elif wave is not None and (wave > self.current_wave or
-                                               (wave == self.current_wave
-                                                and not self.engines_running)):
+                    elif outputs.start_wave is not None and (
+                            wave > self.current_wave or
+                        (wave == self.current_wave
+                         and not self.engines_running)):
                         # Engine received request for a non-current wave so
                         # we must ensure that other engines progress to the
                         # next wave.
                         self.current_wave = wave
                         self.engines_running = True
-                        from_eng_id = data[5:7]
-                        self._send_start_wave(input_back, wave, from_eng_id)
-                    continue
+                        self._send_start_wave(publish_back, wave, eng_index)
 
-                api_frame, type_frame, data_frame = input_front.recv_multipart(
-                    copy=False)
+    @staticmethod
+    def _send_start_wave(socket: zmq.Socket, wave: int,
+                         exclude_engine_index: Optional[int]):
+        wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
+        socket.send_multipart(
+            (EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
-                request_type = EngineCoreRequestType(bytes(type_frame.buffer))
-                api_id = api_frame.buffer
-
-                if request_type == EngineCoreRequestType.ADD:
-                    request = add_request_decoder.decode(data_frame.buffer)
-                    eng_id = self.get_eng_id_for_request()
-                    self.reqs_in_flight[request.request_id] = (api_id, eng_id)
-                    input_back.send_multipart((eng_id, type_frame, data_frame),
-                                              copy=False)
-                    if not self.engines_running:
-                        # Send dp start loop control message to all other
-                        # engines.
-                        self.engines_running = True
-                        self._send_start_wave(input_back, self.current_wave,
-                                              eng_id)
-
-                elif request_type == EngineCoreRequestType.UTILITY:
-                    call_id, _, _ = generic_decoder.decode(data_frame.buffer)
-                    self.utility_pending[call_id] = api_id
-                    for eng in self.engines:
-                        input_back.send_multipart(
-                            (eng.identity, type_frame, data_frame), copy=False)
-
-                elif request_type == EngineCoreRequestType.ABORT:
-                    self.handle_abort_request(input_back, type_frame,
-                                              data_frame, generic_decoder,
-                                              encoder)
-
-    def get_eng_id_for_request(self) -> bytes:
-        return min(self.engines, key=lambda e: e.request_counts[1]).identity
-
-    def handle_abort_request(self, input_back: zmq.Socket, type_frame: Frame,
-                             data_frame: Frame, decoder: MsgpackDecoder,
-                             encoder: MsgpackEncoder):
-        request_ids = decoder.decode(data_frame)
-        if len(request_ids) == 1:
-            # Fast-path common case.
-            _, eng_id = self.reqs_in_flight.get(request_ids[0], NONE_TUPLE)
-            if eng_id is not None:
-                input_back.send_multipart((eng_id, type_frame, data_frame),
-                                          copy=False)
-            return
-
-        by_engine: dict[bytes, list[str]] = defaultdict(lambda: [])
-        for req_id in request_ids:
-            _, eng_id = self.reqs_in_flight.get(req_id, NONE_TUPLE)
-            if eng_id is not None:
-                by_engine[eng_id].append(req_id)
-
-        for eng_id, req_ids in by_engine.items():
-            encoded = encoder.encode(req_ids)
-            input_back.send_multipart((eng_id, type_frame, encoded),
-                                      copy=False)
-
-    def _send_start_wave(self, input_back: zmq.Socket, wave: int,
-                         excude_eng_id: bytes):
-        wave_encoded = msgspec.msgpack.encode(wave)
-        for eng in self.engines:
-            if eng.identity != excude_eng_id:
-                input_back.send_multipart(
-                    (eng.identity, EngineCoreRequestType.START_DP_WAVE.value,
-                     wave_encoded),
-                    copy=False)
-
-    def process_outputs_socket(self, front_address: str, back_address: str,
-                               inproc_path: str):
-        decoder = MsgpackDecoder(EngineCoreOutputs)
-        encoder = MsgpackEncoder()
-
-        with make_zmq_socket(
-                path=front_address,
-                ctx=self.ctx,
-                socket_type=zmq.ROUTER,
-                bind=True,
-        ) as output_front, make_zmq_socket(
-                path=back_address,
-                ctx=self.ctx,
-                socket_type=zmq.PULL,
-                bind=True,
-        ) as output_back, self.ctx.socket(zmq.PAIR) as inproc_socket:
-
-            inproc_socket.connect(inproc_path)
-            api_outs = defaultdict(list)
-            while True:
-                frame = output_back.recv(copy=False)
-                outputs: EngineCoreOutputs = decoder.decode(frame.buffer)
-
-                if outputs.utility_output:
-                    call_id = outputs.utility_output.call_id
-                    api_id = self.utility_pending.pop(call_id, None)
-                    if api_id is not None:
-                        output_front.send_multipart((api_id, frame),
-                                                    copy=False)
-                    continue
-
-                eng_index = outputs.engine_index
-                if outputs.scheduler_stats:
-                    stats = self.engines[eng_index].request_counts
-                    stats[0] = outputs.scheduler_stats.num_waiting_reqs
-                    stats[1] = outputs.scheduler_stats.num_running_reqs
-
-                for out in outputs.outputs:
-                    api_index, _ = self.reqs_in_flight.get(
-                        out.request_id, NONE_TUPLE)
-                    if api_index is not None:
-                        api_outs.get(api_index).append(out)
-
-                for req_id in outputs.finished_requests or ():
-                    self.reqs_in_flight.pop(req_id, None)
-
-                if outputs.wave_complete is not None or (outputs.start_wave
-                                                         is not None):
-                    # Notify input thread.
-                    prefix = b'c' if outputs.wave_complete is not None else b's'
-                    eng_id = self.engines[eng_index].identity
-                    wave = outputs.wave_complete.to_bytes(length=8,
-                                                          byteorder="little")
-                    inproc_socket.send(prefix + wave + eng_id, copy=False)
-
-                while api_outs:
-                    api_index, out_list = api_outs.popitem()
-                    new_outputs = EngineCoreOutputs(eng_index, out_list)
-                    encoded = encoder.encode(new_outputs)
-                    api_id = self.api_ids[api_index]
-                    # TODO reuse buffer
-                    output_front.send_multipart((api_id, encoded), copy=False)
+    def _get_engine_list(self) -> Optional[list[int]]:
+        shortlist = []
+        min_counts = [sys.maxsize, sys.maxsize]
+        for i, e in enumerate(self.engines):
+            if e.request_counts <= min_counts:
+                if e.request_counts < min_counts:
+                    shortlist.clear()
+                shortlist.append(i)
+        return None if len(shortlist) == len(self.engines) else shortlist

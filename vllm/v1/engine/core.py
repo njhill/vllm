@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
-from vllm.utils import make_zmq_socket, resolve_obj_by_qualname, zmq_socket_ctx
+from vllm.utils import make_zmq_socket, resolve_obj_by_qualname
 from vllm.v1.core.kv_cache_utils import (get_kv_cache_config,
                                          unify_kv_cache_configs)
 from vllm.v1.core.sched.interface import SchedulerInterface
@@ -33,6 +33,7 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
 from vllm.v1.engine.mm_input_cache import MirroredProcessingCache
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -315,7 +316,7 @@ class EngineCoreProc(EngineCore):
         self,
         vllm_config: VllmConfig,
         on_head_node: bool,
-        input_address: str,
+        handshake_address: str,
         executor_class: type[Executor],
         log_stats: bool,
         engine_index: int = 0,
@@ -328,15 +329,22 @@ class EngineCoreProc(EngineCore):
         # Create input socket.
         input_ctx = zmq.Context()
         identity = engine_index.to_bytes(length=2, byteorder="little")
-        input_socket = make_zmq_socket(input_ctx,
-                                       input_address,
-                                       zmq.DEALER,
-                                       identity=identity,
-                                       bind=False)
-        try:
+        with make_zmq_socket(input_ctx,
+                             handshake_address,
+                             zmq.DEALER,
+                             identity=identity,
+                             linger=5000,
+                             bind=False) as handshake_socket:
+
             # Register engine with front-end.
-            output_address = self.startup_handshake(
-                input_socket, on_head_node, vllm_config.parallel_config)
+            addresses = self.startup_handshake(handshake_socket, on_head_node,
+                                               vllm_config.parallel_config)
+            input_addresses: list[str] = addresses["input_addresses"]
+            output_addresses: list[str] = addresses["output_addresses"]
+            coord_in_addr: Optional[str] = addresses.get("coord_in_address")
+            coord_out_addr: Optional[str] = addresses.get("coord_out_address")
+            self.client_count = len(output_addresses)
+            self.coordinator = coord_out_addr is not None
 
             # Update config which may have changed from the handshake.
             vllm_config.__post_init__()
@@ -348,41 +356,39 @@ class EngineCoreProc(EngineCore):
             super().__init__(vllm_config, executor_class, log_stats,
                              executor_fail_callback)
 
+            self.engine_index = engine_index
             self.step_fn = (self.step if self.batch_queue is None else
                             self.step_with_batch_queue)
             self.engines_running = False
+            self.last_counts = (0, 0)
 
             # Send ready message.
-            input_socket.send(
+            handshake_socket.send(
                 msgspec.msgpack.encode({
                     "status": "READY",
                     "local": on_head_node
                 }))
 
-            # Background Threads and Queues for IO. These enable us to
-            # overlap ZMQ socket IO with GPU since they release the GIL,
-            # and to overlap some serialization/deserialization with the
-            # model forward pass.
-            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
-            self.input_queue = input_queue
-            self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
-                                                 bytes]]()
-            threading.Thread(target=self.process_input_socket,
-                             args=(input_socket, ),
-                             daemon=True).start()
-            input_socket = None
-            self.output_thread = threading.Thread(
-                target=self.process_output_socket,
-                args=(output_address, engine_index),
-                daemon=True)
-            self.output_thread.start()
-        finally:
-            if input_socket is not None:
-                input_socket.close(linger=0)
+        # Background Threads and Queues for IO. These enable us to
+        # overlap ZMQ socket IO with GPU since they release the GIL,
+        # and to overlap some serialization/deserialization with the
+        # model forward pass.
+        # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+        self.input_queue = input_queue
+        self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
+                                              bytes]]()
+        threading.Thread(target=self.process_input_sockets,
+                         args=(input_addresses, coord_in_addr, identity),
+                         daemon=True).start()
+        self.output_thread = threading.Thread(
+            target=self.process_output_sockets,
+            args=(output_addresses, coord_out_addr, engine_index),
+            daemon=True)
+        self.output_thread.start()
 
     @staticmethod
     def startup_handshake(input_socket: zmq.Socket, on_head_node: bool,
-                          parallel_config: ParallelConfig) -> str:
+                          parallel_config: ParallelConfig) -> dict[str, Any]:
 
         # Send registration message.
         input_socket.send(
@@ -401,14 +407,11 @@ class EngineCoreProc(EngineCore):
         init_message = msgspec.msgpack.decode(init_bytes)
         logger.debug("Received init message: %s", init_message)
 
-        output_socket_address = init_message["output_socket_address"]
-        #TBD(nick) maybe replace IP with configured head node address
-
-        received_parallel_config = init_message["parallel_config"]
+        received_parallel_config = init_message.pop("parallel_config")
         for key, value in received_parallel_config.items():
             setattr(parallel_config, key, value)
 
-        return output_socket_address
+        return init_message["addresses"]
 
     @staticmethod
     def run_engine_core(*args,
@@ -500,10 +503,31 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs = self.step_fn()
+
+        if not outputs:
+            return
+
+        if self.client_count > 1:
+            counts = (len(self.scheduler.running), len(self.scheduler.waiting))
+            if counts != self.last_counts:
+                self.last_counts = counts
+                stats_output = EngineCoreOutputs(
+                    scheduler_stats=SchedulerStats(*counts),
+                    engine_index=self.engine_index)
+                if self.coordinator:
+                    outputs[-1] = stats_output
+                else:
+                    for i in range(self.client_count):
+                        output = outputs.get(i)
+                        if output is None:
+                            outputs[i] = stats_output
+                        elif output.scheduler_stats is None:
+                            output.scheduler_stats = (
+                                stats_output.scheduler_stats)
+
         # Put EngineCoreOutputs into the output queue.
-        if outputs:
-            for output in outputs.items():
-                self.output_queue.put_nowait(output)
+        for output in outputs.items():
+            self.output_queue.put_nowait(output)
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
@@ -558,35 +582,59 @@ class EngineCoreProc(EngineCore):
             logger.fatal("vLLM shutdown signal from EngineCore failed "
                          "to send. Please report this issue.")
 
-    def process_input_sockets(self, input_sockets: list[zmq.Socket]):
+    def process_input_sockets(self, input_addresses: list[str],
+                              coord_input_address: Optional[str],
+                              identity: bytes):
         """Input socket IO thread."""
 
         # Msgpack serialization decoding.
         add_request_decoder = MsgpackDecoder(EngineCoreRequest)
         generic_decoder = MsgpackDecoder()
 
-        poller = zmq.Poller()
-        for input_socket in input_sockets:
-            poller.register(input_socket, zmq.POLLIN)
+        with ExitStack() as stack, zmq.Context() as ctx:
+            input_sockets = [
+                stack.enter_context(
+                    make_zmq_socket(ctx,
+                                    input_address,
+                                    zmq.DEALER,
+                                    identity=identity,
+                                    bind=False))
+                for input_address in input_addresses
+            ]
+            coord_socket = stack.enter_context(
+                make_zmq_socket(
+                    ctx,
+                    coord_input_address,
+                    zmq.XSUB,
+                    identity=identity,
+                    bind=False)) if coord_input_address is not None else None
 
-        while True:
-            for input_socket, _ in poller.poll():
-                # (RequestType, RequestData)
-                type_frame, *data_frames = input_socket.recv_multipart(
-                    copy=False)
-                request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+            poller = zmq.Poller()
+            for input_socket in input_sockets:
+                poller.register(input_socket, zmq.POLLIN)
+                if coord_socket is not None:
+                    poller.register(coord_socket, zmq.POLLIN)
 
-                # Deserialize the request data.
-                decoder = add_request_decoder if (
-                    request_type
-                    == EngineCoreRequestType.ADD) else generic_decoder
-                request = decoder.decode(data_frames)
+            while True:
+                for input_socket, _ in poller.poll():
+                    # (RequestType, RequestData)
+                    type_frame, *data_frames = input_socket.recv_multipart(
+                        copy=False)
+                    request_type = EngineCoreRequestType(
+                        bytes(type_frame.buffer))
 
-                # Push to input queue for core busy loop.
-                self.input_queue.put_nowait((request_type, request))
+                    # Deserialize the request data.
+                    decoder = add_request_decoder if (
+                        request_type
+                        == EngineCoreRequestType.ADD) else generic_decoder
+                    request = decoder.decode(data_frames)
+
+                    # Push to input queue for core busy loop.
+                    self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(self, output_paths: list[str],
-                              engine_index: int):
+                               coord_output_path: Optional[str],
+                               engine_index: int):
         """Output socket IO thread."""
 
         # Msgpack serialization encoding.
@@ -600,23 +648,35 @@ class EngineCoreProc(EngineCore):
 
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
-        with ExitStack() as stack:
+        with ExitStack() as stack, zmq.Context() as ctx:
             sockets = [
                 stack.enter_context(
-                    zmq_socket_ctx(output_path, zmq.PUSH, linger=4000))
+                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000))
                 for output_path in output_paths
             ]
+            coord_socket = stack.enter_context(
+                make_zmq_socket(
+                    ctx, coord_output_path, zmq.PUSH,
+                    linger=4000)) if coord_output_path is not None else None
             max_reuse_bufs = len(sockets) + 1
 
             while True:
                 output = self.output_queue.get()
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
-                        socket.send(output, copy=False)
+                        socket.send(output)
+                        #TODO also send to coordinator here?
                     break
                 assert not isinstance(output, bytes)
                 client_index, outputs = output
                 outputs.engine_index = engine_index
+
+                if client_index == -1:
+                    # Don't reuse buffer for coordinator message
+                    # which will be very small.
+                    assert coord_socket is not None
+                    coord_socket.send_multipart(encoder.encode(outputs))
+                    continue
 
                 # Reclaim buffers that zmq is finished with.
                 while pending and pending[-1][0].done:
@@ -700,15 +760,16 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Request received for an already-completed wave, notify
                 # front-end that we need to start the next one.
                 self.output_queue.put_nowait(
-                    EngineCoreOutputs(start_wave=self.current_wave))
+                    (-1, EngineCoreOutputs(start_wave=self.current_wave)))
 
         super().add_request(request)
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
-            new_wave: int = request
-            if new_wave >= self.current_wave:
+            new_wave, exclude_eng_index = request
+            if exclude_eng_index != self.engine_index and (
+                    new_wave >= self.current_wave):
                 self.current_wave = new_wave
                 if not self.engines_running:
                     logger.debug("EngineCore starting idle loop for wave %d.",
@@ -761,7 +822,8 @@ class DPEngineCoreProc(EngineCoreProc):
                     logger.debug("Wave %d finished, pausing engine loop.",
                                  self.current_wave)
                     self.output_queue.put_nowait(
-                        EngineCoreOutputs(wave_complete=self.current_wave))
+                        (-1,
+                         EngineCoreOutputs(wave_complete=self.current_wave)))
                 self.current_wave += 1
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
