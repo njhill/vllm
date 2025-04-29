@@ -1,63 +1,80 @@
 # SPDX-License-Identifier: Apache-2.0
+import multiprocessing
 import sys
 import time
 from typing import Optional
 
 import msgspec.msgpack
 import zmq
-from config import ParallelConfig
 
-from vllm.utils import make_zmq_socket
+from config import ParallelConfig
+from vllm.utils import make_zmq_socket, get_mp_context, get_open_zmq_ipc_path, get_open_port, get_tcp_uri
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
-from vllm.v1.utils import get_engine_zmq_addresses, wait_for_engine_startup
-
-NONE_TUPLE = (None, None)
 
 
-class EngineRouter:
+class DPCoordinator:
 
-    def __init__(self, parallel_config: ParallelConfig, api_server_count: int):
+    def __init__(self, parallel_config: ParallelConfig):
 
-        self.back_input_address, self.back_output_address = (
-            get_engine_zmq_addresses(parallel_config, False))
+        # Assume coordinator is colocated with front-end procs.
+        front_publish_address = get_open_zmq_ipc_path()
 
-    def get_engine_zmq_addresses(self):
-        return self.back_input_address, self.back_output_address
+        dp_size = parallel_config.data_parallel_size
+        local_engine_count = parallel_config.data_parallel_size_local
+        assert dp_size > 1, "Coordinator only used for data parallel"
 
-    def run_engine_router_proc(self):
-        pass  # TODO wip
+        if local_engine_count == dp_size:
+            back_publish_address = get_open_zmq_ipc_path()
+            back_output_address = get_open_zmq_ipc_path()
+        else:
+            host = parallel_config.data_parallel_master_ip
+            output_port = get_open_port()
+            input_port = get_open_port()
+            back_publish_address = get_tcp_uri(host, input_port)
+            back_output_address = get_tcp_uri(host, output_port)
 
+        context = get_mp_context()
+        self.proc: multiprocessing.Process = context.Process(
+            target=CoordinatorProc.run_coordinator,
+                name=f"VLLM_DP_Coordinator",
+                kwargs={
+                    "num_engines": parallel_config.data_parallel_size,
+                    "front_publish_address": front_publish_address,
+                    "back_output_address": back_output_address,
+                    "back_publish_address": back_publish_address,
+                },
+                daemon=True)
 
-# Sockets:
-#   - Publish for balancing (rcv for new requests)
-#   -
+        self.stats_publish_address = front_publish_address
+        self.coord_in_address = back_publish_address
+        self.coord_out_address = back_output_address
+
+    def get_stats_publish_address(self) -> str:
+        return self.stats_publish_address
+
+    def get_engine_socket_addresses(self) -> dict[str, str]:
+        return {
+            "coord_in_address": self.coord_in_address,
+            "coord_out_address": self.coord_out_address,
+        }
+
+    def close(self):
+        self.proc.terminate()
 
 
 class EngineState:
 
     def __init__(self):
-        # waiting, running
+        # running, waiting
         self.request_counts = [0, 0]
 
 
-class RouterProc:
+class CoordinatorProc:
 
-    def __init__(self, parallel_config: ParallelConfig):
+    def __init__(self, engine_count: int):
 
         self.ctx = zmq.Context()
-        self.parallel_config = parallel_config
-
-        engine_count = parallel_config.data_parallel_size
-        local_engine_count = parallel_config.data_parallel_size_local
-
-        self.output_address = ""  #TODO
-
-        # front_input_addr = get_open_zmq_ipc_path()
-        # front_output_addr = get_open_zmq_ipc_path()
-
-        back_input_address, back_output_address = get_engine_zmq_addresses(
-            parallel_config, False)
 
         self.engines = [EngineState() for _ in range(engine_count)]
 
@@ -65,12 +82,27 @@ class RouterProc:
         self.engines_running = False
         self.stats_changed = False
 
-    def process_input_socket(self, front_address: str, back_address: str,
-                             inproc_path: str):
-        """Input socket IO thread."""
+    @staticmethod
+    def run_coordinator(
+        engine_count: int,
+        front_publish_address: str,
+        back_output_address: str,
+        back_publish_address: str,
+    ):
 
-        front_publish_address, front_input_address = front_address
-        back_publish_address, back_output_address = back_address
+        coordinator = CoordinatorProc(
+            engine_count=engine_count)
+
+        coordinator.process_input_socket(
+            front_publish_address,
+            back_output_address,
+            back_publish_address,
+        )
+
+    def process_input_socket(self,
+                             front_publish_address: str,
+                             back_output_address: str,
+                             back_publish_address: str):
 
         decoder = MsgpackDecoder(EngineCoreOutputs)
         encoder = MsgpackEncoder()
@@ -92,13 +124,18 @@ class RouterProc:
                 bind=True,
         ) as publish_back:
 
-            wait_for_engine_startup(input_socket=input_back,
-                                    output_address=self.output_address,
-                                    core_engines=self.engines,
-                                    parallel_config=self.parallel_config,
-                                    proc_manager=None)  #TODO
+            # addresses["coord_in_address"] = back_publish_address
+            # addresses["coord_out_address"] = back_output_address
+            #
+            # wait_for_engine_startup(handshake_socket=handshake_socket,
+            #                         addresses=addresses,
+            #                         core_engines=self.engines,
+            #                         parallel_config=self.parallel_config,
+            #                         proc_manager=None)  #TODO
+            #
+            # # TODO signal ready here
 
-            # TODO signal ready here
+
             poller = zmq.Poller()
             poller.register(publish_front)
             poller.register(output_back)
@@ -114,6 +151,8 @@ class RouterProc:
                     publish_front.send(encoder.encode(to_publish))
                     self.stats_changed = False
                     continue
+
+                events = dict(events)
 
                 if publish_front in events:
                     buffer = publish_front.recv()
@@ -165,6 +204,7 @@ class RouterProc:
 
     def _get_engine_list(self) -> Optional[list[int]]:
         shortlist = []
+        # TODO check ordering .. we want to sort by num waiting reqs first
         min_counts = [sys.maxsize, sys.maxsize]
         for i, e in enumerate(self.engines):
             if e.request_counts <= min_counts:

@@ -177,12 +177,11 @@ class CoreEngine:
         self.state = CoreEngineState.NEW
 
         # Only one of these is used
-        self.num_reqs_in_flight = 0
-        self.request_counts = [0, 0]
+        self.request_counts = [0, 0]   #TODO TBC
 
 
-def wait_for_engine_startup(handshake_socket: zmq.Socket, addresses: dict[str,
-                                                                          Any],
+def wait_for_engine_startup(handshake_socket: zmq.Socket,
+                            addresses: dict[str, Any],
                             core_engines: list[CoreEngine],
                             parallel_config: ParallelConfig,
                             proc_manager: Optional[CoreEngineProcManager]):
