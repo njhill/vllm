@@ -507,27 +507,17 @@ class EngineCoreProc(EngineCore):
         if not outputs:
             return
 
-        if self.client_count > 1:
-            counts = (len(self.scheduler.running), len(self.scheduler.waiting))
-            if counts != self.last_counts:
-                self.last_counts = counts
-                stats_output = EngineCoreOutputs(
-                    scheduler_stats=SchedulerStats(*counts),
-                    engine_index=self.engine_index)
-                if self.coordinator:
-                    outputs[-1] = stats_output
-                else:
-                    for i in range(self.client_count):
-                        output = outputs.get(i)
-                        if output is None:
-                            outputs[i] = stats_output
-                        elif output.scheduler_stats is None:
-                            output.scheduler_stats = (
-                                stats_output.scheduler_stats)
-
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items():
             self.output_queue.put_nowait(output)
+
+        if self.coordinator:
+            counts = self.scheduler.get_request_counts()
+            if counts != self.last_counts:
+                self.last_counts = counts
+                stats = SchedulerStats(*counts)
+                self.output_queue.put_nowait(
+                    (-1, EngineCoreOutputs(scheduler_stats=stats)))
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
@@ -601,13 +591,18 @@ class EngineCoreProc(EngineCore):
                                     bind=False))
                 for input_address in input_addresses
             ]
-            coord_socket = stack.enter_context(
-                make_zmq_socket(
-                    ctx,
-                    coord_input_address,
-                    zmq.XSUB,
-                    identity=identity,
-                    bind=False)) if coord_input_address is not None else None
+            if coord_input_address is None:
+                coord_socket = None
+            else:
+                coord_socket = stack.enter_context(
+                    make_zmq_socket(
+                        ctx,
+                        coord_input_address,
+                        zmq.XSUB,
+                        identity=identity,
+                        bind=False))
+                # Send subscription message to coordinator.
+                coord_socket.send(b'\x01')
 
             poller = zmq.Poller()
             for input_socket in input_sockets:

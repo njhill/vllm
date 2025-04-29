@@ -771,6 +771,9 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    def get_request_counts(self) -> tuple[int, int]:
+        return len(self.running), len(self.waiting)
+
     def add_request(self, request: Request) -> None:
         self.waiting.append(request)
         self.requests[request.request_id] = request
