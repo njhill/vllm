@@ -268,8 +268,9 @@ def wait_for_engine_startup(
                      "local" if local else "remote", eng_index)
 
 
-def get_engine_zmq_addresses(parallel_config: ParallelConfig,
-                             spmd_mode: bool) -> tuple[str, str]:
+def get_engine_client_zmq_addresses(
+        parallel_config: ParallelConfig,
+        spmd_mode: bool = False) -> tuple[str, str]:
     """Returns (input_address, output_address)."""
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local

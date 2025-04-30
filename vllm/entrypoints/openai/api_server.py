@@ -1081,16 +1081,13 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         vllm_config = await engine_client.get_vllm_config()
         await init_app_state(engine_client, vllm_config, app.state, args)
 
-        def _listen_addr(a: str) -> str:
-            if is_valid_ipv6_address(a):
-                return '[' + a + ']'
-            return a or "0.0.0.0"
+        addr, port = sock_addr
+        listen_addr = f"[{addr}]" if is_valid_ipv6_address(
+            addr) else addr or "0.0.0.0"
 
         is_ssl = args.ssl_keyfile and args.ssl_certfile
         logger.info("Starting vLLM API server on http%s://%s:%d",
-                    "s" if is_ssl else "", _listen_addr(sock_addr[0]),
-                    sock_addr[1])
-
+                    "s" if is_ssl else "", listen_addr, port)
         shutdown_task = await serve_http(
             app,
             sock=sock,

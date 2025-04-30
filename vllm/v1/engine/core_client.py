@@ -29,7 +29,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.utils import (CoreEngine, CoreEngineProcManager,
-                           get_engine_zmq_addresses, wait_for_engine_startup)
+                           get_engine_client_zmq_addresses,
+                           wait_for_engine_startup)
 
 logger = init_logger(__name__)
 
@@ -392,7 +393,7 @@ class MPClient(EngineCoreClient):
                 self.stats_update_address = client_addresses.get(
                     "stats_update_address")
             else:
-                input_address, output_address = get_engine_zmq_addresses(
+                input_address, output_address = get_engine_client_zmq_addresses(
                     parallel_config, spmd_mode)
 
             # Create input and output sockets.
@@ -858,8 +859,11 @@ class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore."""
 
-    def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
-                 log_stats: bool, client_addresses: Optional[dict[str, str]] = None,
+    def __init__(self,
+                 vllm_config: VllmConfig,
+                 executor_class: type[Executor],
+                 log_stats: bool,
+                 client_addresses: Optional[dict[str, str]] = None,
                  client_index: int = 0):
 
         self.current_wave = 0
