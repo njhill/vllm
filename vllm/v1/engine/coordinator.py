@@ -6,8 +6,8 @@ from typing import Optional
 
 import msgspec.msgpack
 import zmq
-from config import ParallelConfig
 
+from vllm.config import ParallelConfig
 from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
                         get_tcp_uri, make_zmq_socket)
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
@@ -40,12 +40,13 @@ class DPCoordinator:
             target=CoordinatorProc.run_coordinator,
             name="VLLM_DP_Coordinator",
             kwargs={
-                "num_engines": parallel_config.data_parallel_size,
+                "engine_count": parallel_config.data_parallel_size,
                 "front_publish_address": front_publish_address,
                 "back_output_address": back_output_address,
                 "back_publish_address": back_publish_address,
             },
             daemon=True)
+        self.proc.start()
 
         self.stats_publish_address = front_publish_address
         self.coord_in_address = back_publish_address

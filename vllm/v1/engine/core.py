@@ -605,8 +605,13 @@ class EngineCoreProc(EngineCore):
                 # Send subscription message to coordinator.
                 coord_socket.send(b'\x01')
 
+            # Register sockets with poller.
             poller = zmq.Poller()
             for input_socket in input_sockets:
+                # Send initial message to each input socket - this is required
+                # before the front-end ROUTER socket can send input messages
+                # back to us.
+                input_socket.send(b'')
                 poller.register(input_socket, zmq.POLLIN)
                 if coord_socket is not None:
                     poller.register(coord_socket, zmq.POLLIN)
@@ -699,7 +704,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self,
         vllm_config: VllmConfig,
         on_head_node: bool,
-        input_address: str,
+        handshake_address: str,
         executor_class: type[Executor],
         log_stats: bool,
     ):
@@ -717,7 +722,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
-        super().__init__(vllm_config, on_head_node, input_address,
+        super().__init__(vllm_config, on_head_node, handshake_address,
                          executor_class, log_stats, dp_rank)
 
     def _init_data_parallel(self, vllm_config: VllmConfig):

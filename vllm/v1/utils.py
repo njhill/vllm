@@ -4,6 +4,7 @@ import time
 import weakref
 from collections import defaultdict
 from collections.abc import Sequence
+from enum import Enum, auto
 from multiprocessing import Process, connection
 from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar,
                     Union, overload)
@@ -11,7 +12,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar,
 import msgspec
 import torch
 import zmq
-from v1.engine.coordinator import DPCoordinator
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
@@ -20,7 +20,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
                         get_tcp_uri, kill_process_tree)
-from vllm.v1.engine.core_client import STARTUP_POLL_PERIOD_MS, CoreEngineState
+from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor.abstract import Executor
 
 if TYPE_CHECKING:
@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+STARTUP_POLL_PERIOD_MS = 10000
 
 
 class ConstantList(Generic[T], Sequence):
@@ -167,6 +169,12 @@ class CoreEngineProcManager:
         }
 
 
+class CoreEngineState(Enum):
+    NEW = auto()
+    CONNECTED = auto()
+    READY = auto()
+
+
 class CoreEngine:
     """One per data parallel rank."""
 
@@ -202,7 +210,7 @@ def wait_for_engine_startup(
     if coord_proc is not None:
         poller.register(coord_proc.sentinel, zmq.POLLIN)
     while any(conn_pending) or any(start_pending):
-        events = dict(poller.poll(STARTUP_POLL_PERIOD_MS))
+        events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
             if any(conn_pending):
                 logger.debug(
@@ -251,7 +259,7 @@ def wait_for_engine_startup(
                     "data_parallel_size": parallel_config.data_parallel_size,
                 },
             })
-            handshake_socket.send_multipart((eng_identity, *init_message),
+            handshake_socket.send_multipart((eng_identity, init_message),
                                             copy=False)
             conn_pending[0 if local else 1] -= 1
             start_pending[0 if local else 1] += 1

@@ -9,7 +9,6 @@ from collections import deque
 from collections.abc import Awaitable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
-from enum import Enum, auto
 from threading import Thread
 from typing import Any, Callable, Optional, TypeVar, Union
 
@@ -37,8 +36,6 @@ logger = init_logger(__name__)
 AnyFuture = Union[asyncio.Future[Any], Future[Any]]
 
 _R = TypeVar('_R')  # Return type for collective_rpc
-
-STARTUP_POLL_PERIOD_MS = 10000
 
 
 class EngineCoreClient(ABC):
@@ -258,12 +255,12 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
 
-class CoreEngineState(Enum):
-    NEW = auto()
-    CONNECTED = auto()
-    READY = auto()
-
-
+# class CoreEngineState(Enum):
+#     NEW = auto()
+#     CONNECTED = auto()
+#     READY = auto()
+#
+#
 # class CoreEngine:
 #     """One per data parallel rank."""
 #
@@ -411,6 +408,18 @@ class MPClient(EngineCoreClient):
                     self.stats_update_address = (
                         coordinator.get_stats_publish_address())
 
+            # Wait for ready messages from each engine on the input socket.
+            # They should have already completed the handshake so only a short
+            # timeout is needed.
+            identities = set(e.identity for e in self.core_engines)
+            sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            while identities:
+                if not sync_input_socket.poll(timeout=3000):
+                    raise TimeoutError("Timed out waiting for engines to send"
+                                       "initial message on input socket.")
+                identity, _ = sync_input_socket.recv_multipart()
+                identities.remove(identity)
+
             self.core_engine = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
 
@@ -459,9 +468,9 @@ class MPClient(EngineCoreClient):
 
     def _wait_for_engine_startup(self, input_address: str, output_address: str,
                                  parallel_config: ParallelConfig):
-        addresses = {
-            "input_address": input_address,
-            "output_address": output_address
+        addresses: dict[str, Any] = {
+            "input_addresses": [input_address],
+            "output_addresses": [output_address],
         }
 
         coordinator = self.resources.coordinator
