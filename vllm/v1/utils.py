@@ -11,6 +11,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar,
 import msgspec
 import torch
 import zmq
+from v1.engine.coordinator import DPCoordinator
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
@@ -176,15 +177,15 @@ class CoreEngine:
 
         self.state = CoreEngineState.NEW
 
-        # Only one of these is used
-        self.request_counts = [0, 0]   #TODO TBC
 
-
-def wait_for_engine_startup(handshake_socket: zmq.Socket,
-                            addresses: dict[str, Any],
-                            core_engines: list[CoreEngine],
-                            parallel_config: ParallelConfig,
-                            proc_manager: Optional[CoreEngineProcManager]):
+def wait_for_engine_startup(
+    handshake_socket: zmq.Socket,
+    addresses: dict[str, Any],
+    core_engines: list[CoreEngine],
+    parallel_config: ParallelConfig,
+    proc_manager: Optional[CoreEngineProcManager],
+    coordinator: Optional[DPCoordinator],
+):
 
     # Wait for engine core process(es) to send ready messages.
     local_count = parallel_config.data_parallel_size_local
@@ -197,8 +198,11 @@ def wait_for_engine_startup(handshake_socket: zmq.Socket,
     if proc_manager is not None:
         for sentinel in proc_manager.sentinels():
             poller.register(sentinel, zmq.POLLIN)
+    coord_proc = coordinator.proc if coordinator is not None else None
+    if coord_proc is not None:
+        poller.register(coord_proc.sentinel, zmq.POLLIN)
     while any(conn_pending) or any(start_pending):
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
+        events = dict(poller.poll(STARTUP_POLL_PERIOD_MS))
         if not events:
             if any(conn_pending):
                 logger.debug(
@@ -212,6 +216,8 @@ def wait_for_engine_startup(handshake_socket: zmq.Socket,
         if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
             finished = proc_manager.finished_procs() if proc_manager else {}
+            if coord_proc is not None and coord_proc.exitcode is not None:
+                finished[coord_proc.name] = coord_proc.exitcode
             raise RuntimeError("Engine core initialization failed. "
                                "See root cause above. "
                                f"Failed core proc(s): {finished}")

@@ -503,7 +503,6 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs = self.step_fn()
-
         if not outputs:
             return
 
@@ -512,6 +511,8 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
 
         if self.coordinator:
+            # If there is a DP coordinator, publish our request counts
+            # (if they've changed)
             counts = self.scheduler.get_request_counts()
             if counts != self.last_counts:
                 self.last_counts = counts
@@ -595,12 +596,11 @@ class EngineCoreProc(EngineCore):
                 coord_socket = None
             else:
                 coord_socket = stack.enter_context(
-                    make_zmq_socket(
-                        ctx,
-                        coord_input_address,
-                        zmq.XSUB,
-                        identity=identity,
-                        bind=False))
+                    make_zmq_socket(ctx,
+                                    coord_input_address,
+                                    zmq.XSUB,
+                                    identity=identity,
+                                    bind=False))
                 # Send subscription message to coordinator.
                 coord_socket.send(b'\x01')
 

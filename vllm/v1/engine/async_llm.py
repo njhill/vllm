@@ -191,9 +191,6 @@ class AsyncLLM(EngineClient):
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown()
 
-        # if output_processor := getattr(self, "output_processor", None):
-        #     output_processor.propagate_error(asyncio.CancelledError())
-
         if handler := getattr(self, "output_handler", None):
             handler.cancel()
 

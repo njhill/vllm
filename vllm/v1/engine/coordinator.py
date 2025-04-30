@@ -6,9 +6,10 @@ from typing import Optional
 
 import msgspec.msgpack
 import zmq
-
 from config import ParallelConfig
-from vllm.utils import make_zmq_socket, get_mp_context, get_open_zmq_ipc_path, get_open_port, get_tcp_uri
+
+from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
+                        get_tcp_uri, make_zmq_socket)
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
@@ -37,14 +38,14 @@ class DPCoordinator:
         context = get_mp_context()
         self.proc: multiprocessing.Process = context.Process(
             target=CoordinatorProc.run_coordinator,
-                name=f"VLLM_DP_Coordinator",
-                kwargs={
-                    "num_engines": parallel_config.data_parallel_size,
-                    "front_publish_address": front_publish_address,
-                    "back_output_address": back_output_address,
-                    "back_publish_address": back_publish_address,
-                },
-                daemon=True)
+            name="VLLM_DP_Coordinator",
+            kwargs={
+                "num_engines": parallel_config.data_parallel_size,
+                "front_publish_address": front_publish_address,
+                "back_output_address": back_output_address,
+                "back_publish_address": back_publish_address,
+            },
+            daemon=True)
 
         self.stats_publish_address = front_publish_address
         self.coord_in_address = back_publish_address
@@ -90,8 +91,7 @@ class CoordinatorProc:
         back_publish_address: str,
     ):
 
-        coordinator = CoordinatorProc(
-            engine_count=engine_count)
+        coordinator = CoordinatorProc(engine_count=engine_count)
 
         coordinator.process_input_socket(
             front_publish_address,
@@ -99,8 +99,7 @@ class CoordinatorProc:
             back_publish_address,
         )
 
-    def process_input_socket(self,
-                             front_publish_address: str,
+    def process_input_socket(self, front_publish_address: str,
                              back_output_address: str,
                              back_publish_address: str):
 
@@ -123,18 +122,6 @@ class CoordinatorProc:
                 socket_type=zmq.XPUB,
                 bind=True,
         ) as publish_back:
-
-            # addresses["coord_in_address"] = back_publish_address
-            # addresses["coord_out_address"] = back_output_address
-            #
-            # wait_for_engine_startup(handshake_socket=handshake_socket,
-            #                         addresses=addresses,
-            #                         core_engines=self.engines,
-            #                         parallel_config=self.parallel_config,
-            #                         proc_manager=None)  #TODO
-            #
-            # # TODO signal ready here
-
 
             poller = zmq.Poller()
             poller.register(publish_front)
@@ -203,7 +190,7 @@ class CoordinatorProc:
             (EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
     def _get_engine_list(self) -> Optional[list[int]]:
-        shortlist = []
+        shortlist: list[int] = []
         # TODO check ordering .. we want to sort by num waiting reqs first
         min_counts = [sys.maxsize, sys.maxsize]
         for i, e in enumerate(self.engines):

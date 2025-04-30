@@ -42,7 +42,6 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
-        multi_client: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -51,7 +50,6 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
-        self.multi_client = multi_client
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -756,6 +754,7 @@ class Scheduler(SchedulerInterface):
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids is not None:
+            # Include ids of requests that finished since last outputs were sent.
             for client_index, finished_set in finished_req_ids.items():
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set
