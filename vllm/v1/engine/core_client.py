@@ -19,7 +19,8 @@ import zmq.asyncio
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.utils import get_open_zmq_inproc_path, make_zmq_socket
+from vllm.utils import (get_open_zmq_inproc_path, make_zmq_socket,
+                        zmq_socket_ctx)
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType, UtilityOutput)
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -28,8 +29,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.utils import (CoreEngine, CoreEngineProcManager,
-                           get_engine_client_zmq_addresses,
-                           wait_for_engine_startup)
+                           get_engine_client_zmq_addr, wait_for_engine_startup)
 
 logger = init_logger(__name__)
 
@@ -365,6 +365,7 @@ class MPClient(EngineCoreClient):
             parallel_config = vllm_config.parallel_config
             local_engine_count = parallel_config.data_parallel_size_local
             local_start_index = parallel_config.data_parallel_rank_local
+            dp_size = parallel_config.data_parallel_size
 
             # SPMD mode is where there is an LLM instance per DP rank and
             # one core engine per LLM, see
@@ -380,8 +381,10 @@ class MPClient(EngineCoreClient):
                 local_start_index = 0
                 self.core_engines = [
                     CoreEngine(index=i, local=(i < local_engine_count))
-                    for i in range(parallel_config.data_parallel_size)
+                    for i in range(dp_size)
                 ]
+
+            local_only = spmd_mode or local_engine_count == dp_size
 
             self.stats_update_address: Optional[str] = None
             if client_addresses is not None:
@@ -390,8 +393,9 @@ class MPClient(EngineCoreClient):
                 self.stats_update_address = client_addresses.get(
                     "stats_update_address")
             else:
-                input_address, output_address = get_engine_client_zmq_addresses(
-                    parallel_config, spmd_mode)
+                host = parallel_config.data_parallel_master_ip
+                input_address = get_engine_client_zmq_addr(local_only, host)
+                output_address = get_engine_client_zmq_addr(local_only, host)
 
             # Create input and output sockets.
             self.input_socket = self.resources.input_socket = make_zmq_socket(
@@ -400,9 +404,10 @@ class MPClient(EngineCoreClient):
                 self.ctx, output_address, zmq.PULL)
 
             if client_addresses is None:
-                self._init_engines_direct(vllm_config, local_start_index,
-                                          input_address, output_address,
-                                          executor_class, log_stats)
+                self._init_engines_direct(vllm_config, local_only,
+                                          local_start_index, input_address,
+                                          output_address, executor_class,
+                                          log_stats)
                 coordinator = self.resources.coordinator
                 if coordinator:
                     self.stats_update_address = (
@@ -433,7 +438,7 @@ class MPClient(EngineCoreClient):
             if not success:
                 self._finalizer()
 
-    def _init_engines_direct(self, vllm_config: VllmConfig,
+    def _init_engines_direct(self, vllm_config: VllmConfig, local_only: bool,
                              local_start_index: int, input_address: str,
                              output_address: str,
                              executor_class: type[Executor], log_stats: bool):
@@ -443,30 +448,38 @@ class MPClient(EngineCoreClient):
         parallel_config = vllm_config.parallel_config
         local_engine_count = parallel_config.data_parallel_size_local
         start_index = parallel_config.data_parallel_rank
+        host = parallel_config.data_parallel_master_ip
 
         if len(self.core_engines) > 1:
             self.resources.coordinator = DPCoordinator(parallel_config)
 
-        # Start local engines.
-        if local_engine_count:
-            # In server mode, start_index and local_start_index will
-            # both be 0.
-            self.resources.local_engine_manager = CoreEngineProcManager(
-                EngineCoreProc.run_engine_core,
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                handshake_address=input_address,
-                on_head_node=True,
-                local_engine_count=local_engine_count,
-                start_index=start_index,
-                local_start_index=local_start_index)
+        handshake_address = get_engine_client_zmq_addr(
+            local_only, host, parallel_config.data_parallel_rpc_port)
 
-        # Wait for engine core process(es) to start.
-        self._wait_for_engine_startup(input_address, output_address,
-                                      parallel_config)
+        with zmq_socket_ctx(handshake_address, zmq.ROUTER,
+                            bind=True) as handshake_socket:
 
-    def _wait_for_engine_startup(self, input_address: str, output_address: str,
+            # Start local engines.
+            if local_engine_count:
+                # In server mode, start_index and local_start_index will
+                # both be 0.
+                self.resources.local_engine_manager = CoreEngineProcManager(
+                    EngineCoreProc.run_engine_core,
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    log_stats=log_stats,
+                    handshake_address=handshake_address,
+                    on_head_node=True,
+                    local_engine_count=local_engine_count,
+                    start_index=start_index,
+                    local_start_index=local_start_index)
+
+            # Wait for engine core process(es) to start.
+            self._wait_for_engine_startup(handshake_socket, input_address,
+                                          output_address, parallel_config)
+
+    def _wait_for_engine_startup(self, handshake_socket: zmq.Socket,
+                                 input_address: str, output_address: str,
                                  parallel_config: ParallelConfig):
         addresses: dict[str, Any] = {
             "input_addresses": [input_address],
@@ -478,8 +491,7 @@ class MPClient(EngineCoreClient):
             addresses.update(coordinator.get_engine_socket_addresses())
 
         wait_for_engine_startup(
-            # Get a sync handle to the socket which might be sync or async.
-            zmq.Socket.shadow(self.input_socket),
+            handshake_socket,
             addresses,
             self.core_engines,
             parallel_config,
@@ -551,8 +563,8 @@ class SyncMPClient(MPClient):
             try:
                 shutdown_socket.bind(shutdown_path)
                 poller = zmq.Poller()
-                poller.register(shutdown_socket)
-                poller.register(out_socket)
+                poller.register(shutdown_socket, zmq.POLLIN)
+                poller.register(out_socket, zmq.POLLIN)
                 while True:
                     socks = poller.poll()
                     if not socks:
@@ -937,6 +949,7 @@ class DPAsyncMPClient(AsyncMPClient):
                         target_eng_index = int.from_bytes(buf, "little")
                         msg = msgspec.msgpack.encode(
                             (target_eng_index, self.current_wave))
+                        print("sending msg", msgspec.msgpack.decode(msg))
                         await socket.send(msg)
 
                     buf = None
@@ -952,6 +965,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
                     # Update local load-balancing state.
                     engines, wave, running = msgspec.msgpack.decode(buf)
+                    print("got stats:", engines, wave, running)
                     self.current_wave = wave
                     self.engines_running = running
                     if self.lb_engines != engines:

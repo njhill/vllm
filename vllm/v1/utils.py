@@ -101,6 +101,13 @@ class ConstantList(Generic[T], Sequence):
         return f"ConstantList({self._x})"
 
 
+def get_engine_client_zmq_addr(local_only: bool,
+                               host: str,
+                               port: int = 0) -> str:
+    return get_open_zmq_ipc_path() if local_only else (get_tcp_uri(
+        host, port or get_open_port()))
+
+
 class CoreEngineProcManager:
     """
     Utility class to handle creation, readiness, and shutdown
@@ -274,26 +281,6 @@ def wait_for_engine_startup(
 
         logger.debug("%s from %s core engine process %s.", status,
                      "local" if local else "remote", eng_index)
-
-
-def get_engine_client_zmq_addresses(
-        parallel_config: ParallelConfig,
-        spmd_mode: bool = False) -> tuple[str, str]:
-    """Returns (input_address, output_address)."""
-    dp_size = parallel_config.data_parallel_size
-    local_engine_count = parallel_config.data_parallel_size_local
-
-    if local_engine_count == dp_size or spmd_mode:
-        input_address = get_open_zmq_ipc_path()
-        output_address = get_open_zmq_ipc_path()
-    else:
-        host = parallel_config.data_parallel_master_ip
-        input_port = parallel_config.data_parallel_rpc_port
-        output_port = get_open_port()
-        input_address = get_tcp_uri(host, input_port)
-        output_address = get_tcp_uri(host, output_port)
-
-    return input_address, output_address
 
 
 # Note(rob): shutdown function cannot be a bound method,

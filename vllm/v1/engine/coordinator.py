@@ -91,7 +91,6 @@ class CoordinatorProc:
         back_output_address: str,
         back_publish_address: str,
     ):
-
         coordinator = CoordinatorProc(engine_count=engine_count)
 
         coordinator.process_input_socket(
@@ -105,7 +104,8 @@ class CoordinatorProc:
                              back_publish_address: str):
 
         decoder = MsgpackDecoder(EngineCoreOutputs)
-        encoder = MsgpackEncoder()
+
+        print("backout", back_output_address)
 
         with make_zmq_socket(
                 path=front_publish_address,  # IPC
@@ -125,8 +125,8 @@ class CoordinatorProc:
         ) as publish_back:
 
             poller = zmq.Poller()
-            poller.register(publish_front)
-            poller.register(output_back)
+            poller.register(publish_front, zmq.POLLIN)
+            poller.register(output_back, zmq.POLLIN)
             last_publish = 0
             while True:
                 elapsed = int(time.time() * 1000) - last_publish
@@ -136,7 +136,8 @@ class CoordinatorProc:
                     engine_list = self._get_engine_list()
                     to_publish = (engine_list, self.current_wave,
                                   self.engines_running)
-                    publish_front.send(encoder.encode(to_publish))
+                    msg = msgspec.msgpack.encode(to_publish)
+                    publish_front.send(msg)
                     self.stats_changed = False
                     continue
 
@@ -144,6 +145,11 @@ class CoordinatorProc:
 
                 if publish_front in events:
                     buffer = publish_front.recv()
+                    if buffer == b'\x01':
+                        # Ignore subscription messages.
+                        continue
+                    decoded =  msgspec.msgpack.decode(buffer)
+                    print("decodere here", decoded)
                     engine_index, wave = msgspec.msgpack.decode(buffer)
                     if wave < self.current_wave:
                         engine_index = None
@@ -155,8 +161,9 @@ class CoordinatorProc:
                 if output_back in events:
                     buffer = output_back.recv()
                     outputs: EngineCoreOutputs = decoder.decode(buffer)
+                    print("coord got output:", outputs)
 
-                    assert outputs.outputs is None
+                    assert not outputs.outputs
                     assert outputs.utility_output is None
 
                     eng_index = outputs.engine_index

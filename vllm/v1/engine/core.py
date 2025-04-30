@@ -515,6 +515,7 @@ class EngineCoreProc(EngineCore):
             # If there is a DP coordinator, publish our request counts
             # (if they've changed)
             counts = self.scheduler.get_request_counts()
+            print("maybb send req counts")
             if counts != self.last_counts:
                 self.last_counts = counts
                 stats = SchedulerStats(*counts)
@@ -629,6 +630,7 @@ class EngineCoreProc(EngineCore):
                         request_type
                         == EngineCoreRequestType.ADD) else generic_decoder
                     request = decoder.decode(data_frames)
+                    print("GOTTTT", request_type, request)
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
@@ -655,9 +657,10 @@ class EngineCoreProc(EngineCore):
                     make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000))
                 for output_path in output_paths
             ]
+            print("coord path", coord_output_path)
             coord_socket = stack.enter_context(
                 make_zmq_socket(
-                    ctx, coord_output_path, zmq.PUSH,
+                    ctx, coord_output_path, zmq.PUSH, bind=False,
                     linger=4000)) if coord_output_path is not None else None
             max_reuse_bufs = len(sockets) + 1
 
@@ -675,6 +678,7 @@ class EngineCoreProc(EngineCore):
                 if client_index == -1:
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
+                    print("sending to coord socket!!!")
                     assert coord_socket is not None
                     coord_socket.send_multipart(encoder.encode(outputs))
                     continue
@@ -719,6 +723,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
         self.counter = 0
+        self.current_wave = 0
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -746,7 +751,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.local_dp_rank = local_dp_rank
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
-        self.current_wave = 0
+
 
     def shutdown(self):
         super().shutdown()

@@ -18,13 +18,13 @@ from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import (FlexibleArgumentParser, get_open_port,
-                        get_open_zmq_ipc_path, get_tcp_uri, zmq_socket_ctx)
+from vllm.utils import FlexibleArgumentParser, get_tcp_uri, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.core_client import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.utils import CoreEngine, wait_for_engine_startup
+from vllm.v1.utils import (CoreEngine, get_engine_client_zmq_addr,
+                           wait_for_engine_startup)
 
 logger = init_logger(__name__)
 
@@ -153,14 +153,6 @@ def run_headless(args: argparse.Namespace):
     finally:
         logger.info("Shutting down.")
         engine_manager.close()
-
-
-# TODO move to util
-def get_engine_client_zmq_addr(local_only: bool,
-                               host: str,
-                               port: int = 0) -> str:
-    return get_open_zmq_ipc_path() if local_only else (get_tcp_uri(
-        host, port or get_open_port()))
 
 
 def run_multi_api_server(args: argparse.Namespace):
