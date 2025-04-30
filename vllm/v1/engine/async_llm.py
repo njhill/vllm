@@ -142,6 +142,8 @@ class AsyncLLM(EngineClient):
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         disable_log_requests: bool = False,
         disable_log_stats: bool = False,
+        client_addresses: Optional[dict[str, str]] = None,
+        client_index: int = 0,
     ) -> "AsyncLLM":
         if not envs.VLLM_USE_V1:
             raise ValueError(
@@ -159,6 +161,8 @@ class AsyncLLM(EngineClient):
             log_requests=not disable_log_requests,
             log_stats=not disable_log_stats,
             usage_context=usage_context,
+            client_addresses=client_addresses,
+            client_index=client_index,
         )
 
     @classmethod

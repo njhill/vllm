@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import multiprocessing
 import signal
 from typing import Any
 
 import uvloop
 import zmq
+from multiprocess.context import SpawnProcess
 
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.api_server import run_server
+from vllm.entrypoints.openai.api_server import (run_server, run_server_worker,
+                                                setup_server)
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
 from vllm.logger import init_logger
@@ -39,9 +42,12 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, 'model_tag') and args.model_tag is not None:
             args.model = args.model_tag
 
-        if args.headless:
+        if args.headless or args.api_server_count < 1:
             run_headless(args)
+        elif args.api_server_count > 1:
+            run_multi_api_server(args)
         else:
+            # Single API server (this process).
             uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
@@ -163,6 +169,8 @@ def run_multi_api_server(args: argparse.Namespace):
     num_api_servers = args.api_server_count
     # assert num_api_servers > 1
 
+    listen_address, sock = setup_server(args)
+
     engine_args = AsyncEngineArgs.from_cli_args(args)
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -186,8 +194,6 @@ def run_multi_api_server(args: argparse.Namespace):
         for _ in range(num_api_servers)
     ]
 
-    # Start API servers here.
-
     addresses: dict[str, Any] = {
         "input_addresses": input_addresses,
         "output_addresses": output_addresses,
@@ -195,10 +201,12 @@ def run_multi_api_server(args: argparse.Namespace):
 
     # Set up coordinator for dp > 1.
     coordinator = None
+    stats_update_address = None
     if dp_size > 1:
         # TODO "ready" event for coordinator
         coordinator = DPCoordinator(parallel_config)
         addresses.update(coordinator.get_engine_socket_addresses())
+        stats_update_address = coordinator.get_stats_publish_address()
 
     handshake_address = get_engine_client_zmq_addr(
         local_only, host, parallel_config.data_parallel_rpc_port)
@@ -234,3 +242,30 @@ def run_multi_api_server(args: argparse.Namespace):
             local_engine_manager,
             coordinator,
         )
+
+        # TODO log here
+
+        spawn_context = multiprocessing.get_context("spawn")
+
+        # Start API servers.
+        api_server_workers: list[SpawnProcess] = []
+        for i, in_addr, out_addr in zip(range(num_api_servers),
+                                        input_addresses, output_addresses):
+            client_config = {
+                "input_address": in_addr,
+                "output_address": out_addr,
+                "client_index": i
+            }
+            if stats_update_address is not None:
+                client_config["stats_update_address"] = stats_update_address
+
+            #TODO check signal propagation
+            proc = spawn_context.Process(target=run_server_worker,
+                                         args=(listen_address, sock, args,
+                                               client_config))
+            api_server_workers.append(proc)
+            proc.start()
+
+        # TODO handle failures / clean shutdown here
+        for proc in api_server_workers:
+            proc.join()
