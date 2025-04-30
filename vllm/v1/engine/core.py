@@ -248,8 +248,9 @@ class EngineCore:
             # Blocking until the first result is available.
             model_output = future.result()
             self.batch_queue.task_done()
-            engine_core_outputs = self.scheduler.update_from_output_multi_client(
-                scheduler_output, model_output)
+            engine_core_outputs = (
+                self.scheduler.update_from_output_multi_client(
+                    scheduler_output, model_output))
 
         return engine_core_outputs
 

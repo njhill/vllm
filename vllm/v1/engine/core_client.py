@@ -347,6 +347,7 @@ class MPClient(EngineCoreClient):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        client_addresses: Optional[dict[str, str]] = None,
     ):
         # Serialization setup.
         self.encoder = MsgpackEncoder()
@@ -363,7 +364,51 @@ class MPClient(EngineCoreClient):
         self._finalizer = weakref.finalize(self, self.resources)
         success = False
         try:
-            self._init_engines_direct(vllm_config, executor_class, log_stats)
+            parallel_config = vllm_config.parallel_config
+            local_engine_count = parallel_config.data_parallel_size_local
+            local_start_index = parallel_config.data_parallel_rank_local
+
+            # SPMD mode is where there is an LLM instance per DP rank and
+            # one core engine per LLM, see
+            # examples/offline_inference/data_parallel.py.
+            spmd_mode = local_start_index is not None
+            if spmd_mode:
+                assert local_engine_count == 1
+                self.core_engines = [
+                    CoreEngine(index=local_start_index, local=True)
+                ]
+            else:
+                assert parallel_config.data_parallel_rank == 0
+                local_start_index = 0
+                self.core_engines = [
+                    CoreEngine(index=i, local=(i < local_engine_count))
+                    for i in range(parallel_config.data_parallel_size)
+                ]
+
+            self.stats_update_address: Optional[str] = None
+            if client_addresses is not None:
+                input_address = client_addresses["input_address"]
+                output_address = client_addresses["output_address"]
+                self.stats_update_address = client_addresses.get(
+                    "stats_update_address")
+            else:
+                input_address, output_address = get_engine_zmq_addresses(
+                    parallel_config, spmd_mode)
+
+            # Create input and output sockets.
+            self.input_socket = self.resources.input_socket = make_zmq_socket(
+                self.ctx, input_address, zmq.ROUTER, bind=True)
+            self.resources.output_socket = make_zmq_socket(
+                self.ctx, output_address, zmq.PULL)
+
+            if client_addresses is None:
+                self._init_engines_direct(vllm_config, local_start_index,
+                                          input_address, output_address,
+                                          executor_class, log_stats)
+                coordinator = self.resources.coordinator
+                if coordinator:
+                    self.stats_update_address = (
+                        coordinator.get_stats_publish_address())
 
             self.core_engine = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -379,38 +424,15 @@ class MPClient(EngineCoreClient):
                 self._finalizer()
 
     def _init_engines_direct(self, vllm_config: VllmConfig,
+                             local_start_index: int, input_address: str,
+                             output_address: str,
                              executor_class: type[Executor], log_stats: bool):
+        """Self-contained client mode, launch engine and coordinator process
+        as needed."""
+
         parallel_config = vllm_config.parallel_config
         local_engine_count = parallel_config.data_parallel_size_local
         start_index = parallel_config.data_parallel_rank
-        local_start_index = parallel_config.data_parallel_rank_local
-
-        # SPMD mode is where there is an LLM instance per DP rank and
-        # one core engine per LLM, see
-        # examples/offline_inference/data_parallel.py.
-        spmd_mode = local_start_index is not None
-        if spmd_mode:
-            assert local_engine_count == 1
-            self.core_engines = [
-                CoreEngine(index=local_start_index, local=True)
-            ]
-        else:
-            assert start_index == 0
-            local_start_index = 0
-            self.core_engines = [
-                CoreEngine(index=i, local=(i < local_engine_count))
-                for i in range(parallel_config.data_parallel_size)
-            ]
-
-        input_address, output_address = get_engine_zmq_addresses(
-            parallel_config, spmd_mode)
-
-        # Create input and output sockets.
-        self.input_socket = self.resources.input_socket = make_zmq_socket(
-            self.ctx, input_address, zmq.ROUTER, bind=True)
-        self.resources.output_socket = make_zmq_socket(self.ctx,
-                                                       output_address,
-                                                       zmq.PULL)
 
         if len(self.core_engines) > 1:
             self.resources.coordinator = DPCoordinator(parallel_config)
@@ -641,16 +663,21 @@ class SyncMPClient(MPClient):
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
 
-    def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
-                 log_stats: bool):
+    def __init__(self,
+                 vllm_config: VllmConfig,
+                 executor_class: type[Executor],
+                 log_stats: bool,
+                 client_addresses: Optional[dict[str, str]] = None,
+                 client_index: int = 0):
         super().__init__(
             asyncio_mode=True,
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=log_stats,
+            client_addresses=client_addresses,
         )
 
-        self.client_index = 0
+        self.client_index = client_index
         self.outputs_queue = asyncio.Queue[Union[EngineCoreOutputs,
                                                  Exception]]()
         try:
@@ -832,14 +859,16 @@ class DPAsyncMPClient(AsyncMPClient):
     EngineCore."""
 
     def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
-                 log_stats: bool):
+                 log_stats: bool, client_addresses: Optional[dict[str, str]] = None,
+                 client_index: int = 0):
 
         self.current_wave = 0
         self.engines_running = False
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, CoreEngine] = {}
 
-        super().__init__(vllm_config, executor_class, log_stats)
+        super().__init__(vllm_config, executor_class, log_stats,
+                         client_addresses, client_index)
 
         assert len(self.core_engines) > 1
 
@@ -864,12 +893,10 @@ class DPAsyncMPClient(AsyncMPClient):
         if resources.stats_update_task is not None:
             return
 
-        coordinator = resources.coordinator
-        assert coordinator is not None
-        coord_stats_address = coordinator.get_stats_publish_address()
+        assert self.stats_update_address is not None
 
         async def run_engine_stats_update_task():
-            with make_zmq_socket(self.ctx, coord_stats_address,
+            with make_zmq_socket(self.ctx, self.stats_update_address,
                                  zmq.XSUB) as socket, make_zmq_socket(
                                      self.ctx,
                                      self.first_req_sock_addr,
@@ -885,24 +912,23 @@ class DPAsyncMPClient(AsyncMPClient):
 
                 while True:
                     events = await poller.poll()
-
-                    if len(events
-                           ) == 2 or events[0][0] == first_req_rcv_socket:
+                    if not self.engines_running and len(events) == 2 or (
+                            events[0][0] == first_req_rcv_socket):
                         # Send a message to notify the coordinator that
-                        # we're sending a request while the engines are paused,
-                        # so that it can wake the others up (to run dummy EP loop).
-                        if not self.engines_running:
-                            self.engines_running = True
-                            buf = first_req_rcv_socket.recv(
-                                flags=zmq.NOBLOCK).result()
-                            target_eng_index = int.from_bytes(buf, "little")
-                            msg = msgspec.msgpack.encode(
-                                (target_eng_index, self.current_wave))
-                            await socket.send(msg)
+                        # we're sending a request while the engines are
+                        # paused, so that it can wake the others up
+                        # (to run dummy EP loop).
+                        self.engines_running = True
+                        buf = first_req_rcv_socket.recv(
+                            flags=zmq.NOBLOCK).result()
+                        target_eng_index = int.from_bytes(buf, "little")
+                        msg = msgspec.msgpack.encode(
+                            (target_eng_index, self.current_wave))
+                        await socket.send(msg)
 
                     buf = None
                     while True:
-                        # Drain all stats events (we only care about the latest).
+                        # Drain all stats events (we only care about latest).
                         future: asyncio.Future[bytes] = socket.recv(
                             flags=zmq.NOBLOCK)
                         if isinstance(future.exception(), zmq.Again):

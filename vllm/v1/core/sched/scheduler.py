@@ -754,7 +754,8 @@ class Scheduler(SchedulerInterface):
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids is not None:
-            # Include ids of requests that finished since last outputs were sent.
+            # Include ids of requests that finished since last outputs
+            # were sent.
             for client_index, finished_set in finished_req_ids.items():
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set

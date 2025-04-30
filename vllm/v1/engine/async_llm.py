@@ -52,6 +52,8 @@ class AsyncLLM(EngineClient):
         log_requests: bool = True,
         start_engine_loop: bool = True,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
+        client_addresses: Optional[dict[str, str]] = None,
+        client_index: int = 0,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -119,6 +121,8 @@ class AsyncLLM(EngineClient):
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
+            client_addresses=client_addresses,
+            client_index=client_index,
         )
 
         self.output_handler: Optional[asyncio.Task] = None
