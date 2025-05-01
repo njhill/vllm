@@ -201,7 +201,7 @@ class EngineCore:
             return {}
         scheduler_output = self.scheduler.schedule()
         output = self.model_executor.execute_model(scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output_multi_client(
+        engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, output)  # type: ignore
 
         return engine_core_outputs
@@ -248,9 +248,8 @@ class EngineCore:
             # Blocking until the first result is available.
             model_output = future.result()
             self.batch_queue.task_done()
-            engine_core_outputs = (
-                self.scheduler.update_from_output_multi_client(
-                    scheduler_output, model_output))
+            engine_core_outputs = (self.scheduler.update_from_output(
+                scheduler_output, model_output))
 
         return engine_core_outputs
 
@@ -629,7 +628,6 @@ class EngineCoreProc(EngineCore):
                         request_type
                         == EngineCoreRequestType.ADD) else generic_decoder
                     request = decoder.decode(data_frames)
-                    print("GOTTTT", request_type, request)
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
@@ -656,7 +654,6 @@ class EngineCoreProc(EngineCore):
                     make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000))
                 for output_path in output_paths
             ]
-            print("coord path", coord_output_path)
             coord_socket = stack.enter_context(
                 make_zmq_socket(
                     ctx, coord_output_path, zmq.PUSH, bind=False,

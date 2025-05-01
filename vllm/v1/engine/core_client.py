@@ -414,12 +414,10 @@ class MPClient(EngineCoreClient):
                         coordinator.get_stats_publish_address())
 
             # Wait for ready messages from each engine on the input socket.
-            # They should have already completed the handshake so only a short
-            # timeout is needed.
             identities = set(e.identity for e in self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
             while identities:
-                if not sync_input_socket.poll(timeout=3000):
+                if not sync_input_socket.poll(timeout=600_000):
                     raise TimeoutError("Timed out waiting for engines to send"
                                        "initial message on input socket.")
                 identity, _ = sync_input_socket.recv_multipart()
@@ -928,6 +926,7 @@ class DPAsyncMPClient(AsyncMPClient):
                                      zmq.PAIR,
                                      bind=False) as first_req_rcv_socket:
 
+                # TODO CHECK WHY THIS SUB DOESN'T SEEM TO WORK
                 # Send subscription message.
                 await socket.send(b'\x01')
 
@@ -964,7 +963,6 @@ class DPAsyncMPClient(AsyncMPClient):
 
                     # Update local load-balancing state.
                     engines, wave, running = msgspec.msgpack.decode(buf)
-                    print("got stats:", engines, wave, running)
                     self.current_wave = wave
                     self.engines_running = running
                     if self.lb_engines != engines:

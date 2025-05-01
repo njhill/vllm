@@ -731,7 +731,7 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         prompt_logprobs_dict={},
     )
     engine_core_outputs = scheduler.update_from_output(output,
-                                                       model_runner_output)
+                                                       model_runner_output)[0]
 
     for i in range(len(requests)):
         running_req = scheduler.running[i]

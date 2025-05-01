@@ -159,7 +159,6 @@ class CoordinatorProc:
                 if output_back in events:
                     buffer = output_back.recv()
                     outputs: EngineCoreOutputs = decoder.decode(buffer)
-                    print("coord got output:", outputs)
 
                     assert not outputs.outputs
                     assert outputs.utility_output is None
@@ -199,7 +198,6 @@ class CoordinatorProc:
 
     def _get_engine_list(self) -> Optional[list[int]]:
         shortlist: list[int] = []
-        # TODO check ordering .. we want to sort by num waiting reqs first
         min_counts = [sys.maxsize, sys.maxsize]
         for i, e in enumerate(self.engines):
             if e.request_counts <= min_counts:

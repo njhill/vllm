@@ -10,7 +10,6 @@ import os
 import re
 import signal
 import socket
-import sys
 import tempfile
 import uuid
 from argparse import Namespace
@@ -85,7 +84,6 @@ from vllm.entrypoints.openai.serving_transcription import (
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.utils import (cli_env_setup, load_aware_call,
                                     with_cancellation)
-from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.transformers_utils.config import (
@@ -1101,24 +1099,6 @@ def setup_server(args):
 async def run_server(args, **uvicorn_kwargs) -> None:
     listen_address, sock = setup_server(args)
     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
-
-# TODO move this
-def run_worker(listen_address,
-               sock,
-               args,
-               client_config=None,
-               **uvicorn_kwargs) -> None:
-
-    # Add process-specific prefix to stdout and stderr.
-    from multiprocessing import current_process
-    process_name = current_process().name
-    pid = os.getpid()
-    _add_prefix(sys.stdout, process_name, pid)
-    _add_prefix(sys.stderr, process_name, pid)
-
-    uvloop.run(
-        run_server_worker(listen_address, sock, args, client_config,
-                          **uvicorn_kwargs))
 
 
 async def run_server_worker(listen_address,

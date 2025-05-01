@@ -2,17 +2,20 @@
 
 import argparse
 import multiprocessing
+import os
 import signal
+import sys
+from multiprocessing.context import SpawnProcess
 from typing import Any
 
 import uvloop
 import zmq
-from multiprocess.context import SpawnProcess
+from executor.multiproc_worker_utils import _add_prefix
 
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.api_server import (run_server, run_worker,
+from vllm.entrypoints.openai.api_server import (run_server, run_server_worker,
                                                 setup_server)
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
@@ -220,6 +223,28 @@ def run_multi_api_server(args: argparse.Namespace):
                 start_index=0,
                 local_start_index=0)
 
+        # Start API servers.
+        spawn_context = multiprocessing.get_context("spawn")
+        api_server_workers: list[SpawnProcess] = []
+        for i, in_addr, out_addr in zip(range(num_api_servers),
+                                        input_addresses, output_addresses):
+            client_config = {
+                "input_address": in_addr,
+                "output_address": out_addr,
+                "client_index": i
+            }
+            if stats_update_address is not None:
+                client_config["stats_update_address"] = stats_update_address
+
+            #TODO check signal propagation
+            proc = spawn_context.Process(target=run_api_server_worker,
+                                         name=f"ApiServer_{i}",
+                                         args=(listen_address, sock, args,
+                                               client_config))
+            api_server_workers.append(proc)
+            proc.start()
+
+        # Wait for engine handshakes to complete.
         core_engines = [
             CoreEngine(index=i, local=(i < local_engine_count))
             for i in range(dp_size)
@@ -234,30 +259,24 @@ def run_multi_api_server(args: argparse.Namespace):
             coordinator,
         )
 
-        # TODO log here
-
-        spawn_context = multiprocessing.get_context("spawn")
-
-        # Start API servers.
-        api_server_workers: list[SpawnProcess] = []
-        for i, in_addr, out_addr in zip(range(num_api_servers),
-                                        input_addresses, output_addresses):
-            client_config = {
-                "input_address": in_addr,
-                "output_address": out_addr,
-                "client_index": i
-            }
-            if stats_update_address is not None:
-                client_config["stats_update_address"] = stats_update_address
-
-            #TODO check signal propagation
-            proc = spawn_context.Process(target=run_worker,
-                                         name=f"ApiServer_{i}",
-                                         args=(listen_address, sock, args,
-                                               client_config))
-            api_server_workers.append(proc)
-            proc.start()
-
         # TODO handle failures / clean shutdown here
         for proc in api_server_workers:
             proc.join()
+
+
+def run_api_server_worker(listen_address,
+                          sock,
+                          args,
+                          client_config=None,
+                          **uvicorn_kwargs) -> None:
+
+    # Add process-specific prefix to stdout and stderr.
+    from multiprocessing import current_process
+    process_name = current_process().name
+    pid = os.getpid()
+    _add_prefix(sys.stdout, process_name, pid)
+    _add_prefix(sys.stderr, process_name, pid)
+
+    uvloop.run(
+        run_server_worker(listen_address, sock, args, client_config,
+                          **uvicorn_kwargs))
