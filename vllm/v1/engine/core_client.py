@@ -949,7 +949,6 @@ class DPAsyncMPClient(AsyncMPClient):
                         target_eng_index = int.from_bytes(buf, "little")
                         msg = msgspec.msgpack.encode(
                             (target_eng_index, self.current_wave))
-                        print("sending msg", msgspec.msgpack.decode(msg))
                         await socket.send(msg)
 
                     buf = None

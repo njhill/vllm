@@ -397,7 +397,6 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if stat_loggers:
-                        assert outputs.scheduler_stats is not None
                         AsyncLLM._record_stats(
                             stat_loggers[outputs.engine_index],
                             scheduler_stats=outputs.scheduler_stats,
@@ -421,7 +420,7 @@ class AsyncLLM(EngineClient):
     @staticmethod
     def _record_stats(
         stat_loggers: list[StatLoggerBase],
-        scheduler_stats: SchedulerStats,
+        scheduler_stats: Optional[SchedulerStats],
         iteration_stats: Optional[IterationStats],
     ):
         """static so that it can be used from the output_handler task

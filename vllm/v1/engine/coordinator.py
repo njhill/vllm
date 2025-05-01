@@ -11,7 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
                         get_tcp_uri, make_zmq_socket)
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackDecoder
 
 
 class DPCoordinator:
@@ -105,8 +105,6 @@ class CoordinatorProc:
 
         decoder = MsgpackDecoder(EngineCoreOutputs)
 
-        print("backout", back_output_address)
-
         with make_zmq_socket(
                 path=front_publish_address,  # IPC
                 ctx=self.ctx,
@@ -130,7 +128,7 @@ class CoordinatorProc:
             last_publish = 0
             while True:
                 elapsed = int(time.time() * 1000) - last_publish
-                wait_for = 200 if self.stats_changed else 3000
+                wait_for = 200 if self.stats_changed else 5000
                 events = poller.poll(timeout=max(0, wait_for - elapsed))
                 if not events:
                     engine_list = self._get_engine_list()
@@ -138,6 +136,7 @@ class CoordinatorProc:
                                   self.engines_running)
                     msg = msgspec.msgpack.encode(to_publish)
                     publish_front.send(msg)
+                    last_publish = int(time.time() * 1000)
                     self.stats_changed = False
                     continue
 
@@ -148,13 +147,12 @@ class CoordinatorProc:
                     if buffer == b'\x01':
                         # Ignore subscription messages.
                         continue
-                    decoded =  msgspec.msgpack.decode(buffer)
-                    print("decodere here", decoded)
                     engine_index, wave = msgspec.msgpack.decode(buffer)
                     if wave < self.current_wave:
                         engine_index = None
                     if not self.engines_running:
                         self.engines_running = True
+                        self.stats_changed = True
                         self._send_start_wave(publish_back, self.current_wave,
                                               engine_index)
 
@@ -179,6 +177,7 @@ class CoordinatorProc:
                         if self.current_wave <= wave:
                             self.current_wave = wave + 1
                             self.engines_running = False
+                            self.stats_changed = True
                     elif outputs.start_wave is not None and (
                             wave > self.current_wave or
                         (wave == self.current_wave
@@ -188,6 +187,7 @@ class CoordinatorProc:
                         # next wave.
                         self.current_wave = wave
                         self.engines_running = True
+                        self.stats_changed = True
                         self._send_start_wave(publish_back, wave, eng_index)
 
     @staticmethod
@@ -204,6 +204,7 @@ class CoordinatorProc:
         for i, e in enumerate(self.engines):
             if e.request_counts <= min_counts:
                 if e.request_counts < min_counts:
+                    min_counts = e.request_counts
                     shortlist.clear()
                 shortlist.append(i)
         return None if len(shortlist) == len(self.engines) else shortlist

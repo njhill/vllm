@@ -12,7 +12,7 @@ from multiprocess.context import SpawnProcess
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.api_server import (run_server, run_server_worker,
+from vllm.entrypoints.openai.api_server import (run_server, run_worker,
                                                 setup_server)
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
@@ -166,12 +166,11 @@ def run_multi_api_server(args: argparse.Namespace):
     engine_args = AsyncEngineArgs.from_cli_args(args)
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-
     parallel_config = vllm_config.parallel_config
 
     assert parallel_config.data_parallel_rank == 0
 
-    dp_size = vllm_config.data_parallel_size
+    dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
     host = parallel_config.data_parallel_master_ip
     local_only = local_engine_count == dp_size
@@ -252,7 +251,8 @@ def run_multi_api_server(args: argparse.Namespace):
                 client_config["stats_update_address"] = stats_update_address
 
             #TODO check signal propagation
-            proc = spawn_context.Process(target=run_server_worker,
+            proc = spawn_context.Process(target=run_worker,
+                                         name=f"ApiServer_{i}",
                                          args=(listen_address, sock, args,
                                                client_config))
             api_server_workers.append(proc)

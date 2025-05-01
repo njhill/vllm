@@ -515,7 +515,6 @@ class EngineCoreProc(EngineCore):
             # If there is a DP coordinator, publish our request counts
             # (if they've changed)
             counts = self.scheduler.get_request_counts()
-            print("maybb send req counts")
             if counts != self.last_counts:
                 self.last_counts = counts
                 stats = SchedulerStats(*counts)
@@ -678,7 +677,6 @@ class EngineCoreProc(EngineCore):
                 if client_index == -1:
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
-                    print("sending to coord socket!!!")
                     assert coord_socket is not None
                     coord_socket.send_multipart(encoder.encode(outputs))
                     continue
@@ -751,7 +749,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.local_dp_rank = local_dp_rank
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
-
 
     def shutdown(self):
         super().shutdown()
