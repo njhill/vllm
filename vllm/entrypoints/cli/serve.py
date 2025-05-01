@@ -10,7 +10,6 @@ from typing import Any
 
 import uvloop
 import zmq
-from executor.multiproc_worker_utils import _add_prefix
 
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
@@ -19,6 +18,7 @@ from vllm.entrypoints.openai.api_server import (run_server, run_server_worker,
                                                 setup_server)
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
+from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, get_tcp_uri, zmq_socket_ctx
@@ -236,7 +236,7 @@ def run_multi_api_server(args: argparse.Namespace):
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
 
-            #TODO check signal propagation
+            # TODO check signal propagation
             proc = spawn_context.Process(target=run_api_server_worker,
                                          name=f"ApiServer_{i}",
                                          args=(listen_address, sock, args,
@@ -256,7 +256,7 @@ def run_multi_api_server(args: argparse.Namespace):
             core_engines,
             parallel_config,
             local_engine_manager,
-            coordinator,
+            coordinator.proc if coordinator else None,
         )
 
         # TODO handle failures / clean shutdown here

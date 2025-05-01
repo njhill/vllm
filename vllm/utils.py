@@ -2311,8 +2311,6 @@ def make_zmq_socket(
     if bind is None:
         bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)
 
-    print("MAKE ZMQ SOCK:", path, zmq.SocketType(socket_type), bind)
-
     if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)

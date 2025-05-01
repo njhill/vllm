@@ -8,10 +8,13 @@ import msgspec.msgpack
 import zmq
 
 from vllm.config import ParallelConfig
-from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
-                        get_tcp_uri, make_zmq_socket)
+from vllm.logger import init_logger
+from vllm.utils import get_mp_context, get_open_zmq_ipc_path, make_zmq_socket
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder
+from vllm.v1.utils import get_engine_client_zmq_addr
+
+logger = init_logger(__name__)
 
 
 class DPCoordinator:
@@ -22,18 +25,12 @@ class DPCoordinator:
         front_publish_address = get_open_zmq_ipc_path()
 
         dp_size = parallel_config.data_parallel_size
-        local_engine_count = parallel_config.data_parallel_size_local
         assert dp_size > 1, "Coordinator only used for data parallel"
 
-        if local_engine_count == dp_size:
-            back_publish_address = get_open_zmq_ipc_path()
-            back_output_address = get_open_zmq_ipc_path()
-        else:
-            host = parallel_config.data_parallel_master_ip
-            output_port = get_open_port()
-            input_port = get_open_port()
-            back_publish_address = get_tcp_uri(host, input_port)
-            back_output_address = get_tcp_uri(host, output_port)
+        local_only = dp_size == parallel_config.data_parallel_size_local
+        host = parallel_config.data_parallel_master_ip
+        back_publish_address = get_engine_client_zmq_addr(local_only, host)
+        back_output_address = get_engine_client_zmq_addr(local_only, host)
 
         context = get_mp_context()
         self.proc: multiprocessing.Process = context.Process(
@@ -68,8 +65,7 @@ class DPCoordinator:
 class EngineState:
 
     def __init__(self):
-        # running, waiting
-        self.request_counts = [0, 0]
+        self.request_counts = [0, 0]  # [waiting, running]
 
 
 class CoordinatorProc:
@@ -93,11 +89,14 @@ class CoordinatorProc:
     ):
         coordinator = CoordinatorProc(engine_count=engine_count)
 
-        coordinator.process_input_socket(
-            front_publish_address,
-            back_output_address,
-            back_publish_address,
-        )
+        try:
+            coordinator.process_input_socket(
+                front_publish_address,
+                back_output_address,
+                back_publish_address,
+            )
+        except KeyboardInterrupt:
+            logger.info("DP Coordinator process exiting")
 
     def process_input_socket(self, front_publish_address: str,
                              back_output_address: str,
@@ -128,7 +127,7 @@ class CoordinatorProc:
             last_publish = 0
             while True:
                 elapsed = int(time.time() * 1000) - last_publish
-                wait_for = 200 if self.stats_changed else 5000
+                wait_for = 100 if self.stats_changed else 3000
                 events = poller.poll(timeout=max(0, wait_for - elapsed))
                 if not events:
                     engine_list = self._get_engine_list()

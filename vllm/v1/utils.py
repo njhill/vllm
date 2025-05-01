@@ -20,7 +20,6 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import (get_mp_context, get_open_port, get_open_zmq_ipc_path,
                         get_tcp_uri, kill_process_tree)
-from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor.abstract import Executor
 
 if TYPE_CHECKING:
@@ -199,7 +198,7 @@ def wait_for_engine_startup(
     core_engines: list[CoreEngine],
     parallel_config: ParallelConfig,
     proc_manager: Optional[CoreEngineProcManager],
-    coordinator: Optional[DPCoordinator],
+    coord_process: Optional[Process],
 ):
 
     # Wait for engine core process(es) to send ready messages.
@@ -213,9 +212,8 @@ def wait_for_engine_startup(
     if proc_manager is not None:
         for sentinel in proc_manager.sentinels():
             poller.register(sentinel, zmq.POLLIN)
-    coord_proc = coordinator.proc if coordinator is not None else None
-    if coord_proc is not None:
-        poller.register(coord_proc.sentinel, zmq.POLLIN)
+    if coord_process is not None:
+        poller.register(coord_process.sentinel, zmq.POLLIN)
     while any(conn_pending) or any(start_pending):
         events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
@@ -231,8 +229,8 @@ def wait_for_engine_startup(
         if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
             finished = proc_manager.finished_procs() if proc_manager else {}
-            if coord_proc is not None and coord_proc.exitcode is not None:
-                finished[coord_proc.name] = coord_proc.exitcode
+            if coord_process is not None and coord_process.exitcode is not None:
+                finished[coord_process.name] = coord_process.exitcode
             raise RuntimeError("Engine core initialization failed. "
                                "See root cause above. "
                                f"Failed core proc(s): {finished}")

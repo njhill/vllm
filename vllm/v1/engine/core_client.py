@@ -494,7 +494,7 @@ class MPClient(EngineCoreClient):
             self.core_engines,
             parallel_config,
             self.resources.local_engine_manager,
-            coordinator,
+            coordinator.proc if coordinator else None,
         )
 
     def shutdown(self):
@@ -907,7 +907,7 @@ class DPAsyncMPClient(AsyncMPClient):
             # If we are running in an asyncio event loop, start the stats task.
             # Otherwise, it will be started lazily.
             asyncio.get_running_loop()
-            self._ensure_output_queue_task()
+            self._ensure_stats_update_task()
         except RuntimeError:
             pass
 
