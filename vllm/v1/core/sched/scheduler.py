@@ -977,4 +977,5 @@ class Scheduler(SchedulerInterface):
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in (model_runner_output.finished_sending or ()):
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            self._free_blocks(self.requests[req_id])
+            if request := self.requests.get(req_id):
+                self._free_blocks(request)
