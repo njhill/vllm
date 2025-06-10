@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_SLEEP_WHEN_IDLE: bool = False
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
+    VLLM_DISABLE_FAST_DETOK: bool = False
 
 
 def get_default_cache_root():
@@ -870,6 +871,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # processes via zmq.
     "VLLM_MQ_MAX_CHUNK_BYTES_MB":
     lambda: int(os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")),
+
+    # Disable faster incremental detokenization which uses the tokenizers
+    # library native DecodeStream support. This can be used to avoid a bug
+    # where some models can produce invalid UTF8 in some cases which will
+    # cause requests to fail at that point. This option will likely be removed
+    # in a future version once the behaviour of the underlying tokenizers
+    # library is changed to account for this case.
+    # See: https://github.com/vllm-project/vllm/issues/17448.
+    "VLLM_DISABLE_FAST_DETOK":
+    lambda: bool(int(os.getenv("VLLM_DISABLE_FAST_DETOK", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]

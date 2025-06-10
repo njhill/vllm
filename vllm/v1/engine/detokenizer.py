@@ -9,6 +9,7 @@ from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 from transformers import PreTrainedTokenizerFast
 
+import vllm.envs as envs
 from vllm.engine.output_processor.stop_checker import StopChecker
 from vllm.logger import init_logger
 from vllm.transformers_utils.detokenizer_utils import (
@@ -16,6 +17,11 @@ from vllm.transformers_utils.detokenizer_utils import (
 from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
+
+# Only tokenizers >= 0.21.1 supports DecodeStream used for
+# FastIncrementalDetokenizer.
+USE_FAST_DETOKENIZER = not envs.VLLM_DISABLE_FAST_DETOK and version.parse(
+    tokenizers.__version__) >= version.parse("0.21.1")
 
 
 class IncrementalDetokenizer:
@@ -46,10 +52,9 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
-        if (isinstance(tokenizer, PreTrainedTokenizerFast) and version.parse(
-                tokenizers.__version__) >= version.parse("0.21.1")):
+        if USE_FAST_DETOKENIZER and isinstance(tokenizer,
+                                               PreTrainedTokenizerFast):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            # And only tokenizers >= 0.21.1 supports Fast Detokenizer.
             return FastIncrementalDetokenizer(tokenizer, request)
 
         # Fall back to slow python-based incremental detokenization.
