@@ -456,7 +456,7 @@ class NixlConnectorWorker:
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
 
-        def handshake(path: str, rank: int) -> NixlAgentMetadata:
+        def handshake(path: str, rank: int) -> tuple[NixlAgentMetadata, str]:
             # Send query for the request.
             with zmq_ctx(zmq.REQ, path) as sock:
                 sock.send(GET_META_MSG)
@@ -466,19 +466,20 @@ class NixlConnectorWorker:
                 got_metadata_time = time.perf_counter()
 
                 # Register Remote agent.
-                self.add_remote_agent(metadata, rank)
+                remote_agent_name = self.add_remote_agent(metadata, rank)
                 setup_agent_time = time.perf_counter()
 
                 logger.debug("NIXL handshake: get metadata took: %s",
                              got_metadata_time - start_time)
                 logger.debug("NIXL handshake: add agent took: %s",
                              setup_agent_time - got_metadata_time)
-                return metadata
+                return metadata, remote_agent_name
 
         # Handshake with remote agent-rank0 first to get the tp_size of remote
         path = make_zmq_path("tcp", host, port)
         logger.debug("Querying master rank metadata on path: %s", path)
-        metadata = handshake(path, 0)
+        agent_name_dict: dict[int, str] = {}
+        metadata, agent_name_dict[0] = handshake(path, 0)
 
         # Handshake only with the other TP remote the current local rank will
         # pull from. With homogeneous TP it happens to be the same rank_i.
@@ -488,7 +489,9 @@ class NixlConnectorWorker:
             path = make_zmq_path("tcp", host, port + p_remote_rank)
             logger.debug("Querying metadata on path: %s at remote rank %s",
                          path, p_remote_rank)
-            _ = handshake(path, p_remote_rank)
+            _, agent_name_dict[p_remote_rank] = handshake(path, p_remote_rank)
+
+        return agent_name_dict
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
@@ -629,7 +632,7 @@ class NixlConnectorWorker:
 
     def add_remote_agent(self,
                          nixl_agent_meta: NixlAgentMetadata,
-                         remote_tp_rank: int = 0):
+                         remote_tp_rank: int = 0) -> str:
         """
         Add the remote NIXL agent and prepare the descriptors for reading cache
         blocks from remote.
@@ -669,9 +672,6 @@ class NixlConnectorWorker:
         so that the whole cache is shared by "tp_ratio" D TP workers.
         """ # noqa: E501
         engine_id = nixl_agent_meta.engine_id
-        # TODO re-evaluate refreshing for scaling/recovery
-        if remote_tp_rank in self._remote_agents.get(engine_id, ()):
-            return
 
         if engine_id in self._tp_size:
             assert self._tp_size[engine_id] == nixl_agent_meta.tp_size
@@ -681,7 +681,7 @@ class NixlConnectorWorker:
         # layout and close outputs.
         assert nixl_agent_meta.attn_backend_name == self.backend_name
 
-        remote_agent_meta = self.nixl_wrapper.add_remote_agent(
+        remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata)
 
         # Number of D TP workers reading from a single P TP worker. This is
@@ -747,10 +747,9 @@ class NixlConnectorWorker:
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
             self.dst_xfer_side_handles[
                 engine_id] = self.nixl_wrapper.prep_xfer_dlist(
-                    remote_agent_meta, descs)
+                    remote_agent_name, descs)
 
-        # Only add to _remote_agents dict once we've finished successfully.
-        self._remote_agents[engine_id][remote_tp_rank] = remote_agent_meta
+        return remote_agent_name
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
@@ -880,15 +879,23 @@ class NixlConnectorWorker:
                             fut = self._executor.submit(
                                 self._nixl_handshake, meta.remote_host,
                                 meta.remote_port)
-                            fut.add_done_callback(
-                                lambda f, eid=remote_engine_id: \
-                                self._handshake_futures.pop(eid))
                             self._handshake_futures[remote_engine_id] = fut
+
+                            def done_callback(f: Future, eid=remote_engine_id):
+                                with self._lock:
+                                    del self._handshake_futures[eid]
+                                    try:
+                                        self._remote_agents[eid] = f.result()
+                                    except Exception:
+                                        logger.exception(
+                                            "Handshake with %s failed", eid)
+
+                            fut.add_done_callback(done_callback)
 
                         #TODO handle failure state of f in the callback,
                         # we want to fail the request in this case.
                         fut.add_done_callback(lambda f, entry=(req_id,meta): \
-                                                  self._ready_requests.put(entry))
+                                            self._ready_requests.put(entry))
                         continue
 
             self._read_blocks_for_req(req_id, meta)
