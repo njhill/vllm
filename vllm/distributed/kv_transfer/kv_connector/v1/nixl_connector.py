@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import math
+import queue
 import threading
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -377,13 +379,19 @@ class NixlConnectorWorker:
         # Complete transfer tracker. Used by the rank 0 to track finished
         # transactions on ranks 1 to N-1.
         # [req_id -> count]
-        self._done_recving_count: defaultdict[str,
-                                              int] = defaultdict(lambda: 0)
-        self._done_sending_count: defaultdict[str,
-                                              int] = defaultdict(lambda: 0)
+        self._done_recving_count = defaultdict[str, int](int)
+        self._done_sending_count = defaultdict[str, int](int)
 
-        # Background thread for establishing new connections.
+        # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: Optional[threading.Thread] = None
+        # Background thread for initializing new NIXL handshakes.
+        self._executor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="vllm-nixl-handshake")
+        # Thread results for handshake completion tracking.
+        # eng_id -> handshake future
+        self._handshake_futures: dict[str, Future] = {}
+        self._ready_requests = queue.Queue[tuple[str, ReqMeta]]()
+        self._lock = threading.Lock()
 
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
@@ -673,9 +681,8 @@ class NixlConnectorWorker:
         # layout and close outputs.
         assert nixl_agent_meta.attn_backend_name == self.backend_name
 
-        self._remote_agents[engine_id][
-            remote_tp_rank] = self.nixl_wrapper.add_remote_agent(
-                nixl_agent_meta.agent_metadata)
+        remote_agent_meta = self.nixl_wrapper.add_remote_agent(
+            nixl_agent_meta.agent_metadata)
 
         # Number of D TP workers reading from a single P TP worker. This is
         # 1 when P and D `--tensor-parallel-size` match.
@@ -740,7 +747,10 @@ class NixlConnectorWorker:
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
             self.dst_xfer_side_handles[
                 engine_id] = self.nixl_wrapper.prep_xfer_dlist(
-                    self._remote_agents[engine_id][remote_tp_rank], descs)
+                    remote_agent_meta, descs)
+
+        # Only add to _remote_agents dict once we've finished successfully.
+        self._remote_agents[engine_id][remote_tp_rank] = remote_agent_meta
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
@@ -855,33 +865,56 @@ class NixlConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.requests.items():
+            remote_engine_id = meta.remote_engine_id
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ", req_id,
-                meta.remote_engine_id, len(meta.local_block_ids),
+                remote_engine_id, len(meta.local_block_ids),
                 len(meta.remote_block_ids))
-            self._read_blocks(
-                request_id=req_id,
-                dst_engine_id=meta.remote_engine_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
-                remote_host=meta.remote_host,
-                remote_port=meta.remote_port,
-            )
+
+            if meta.remote_engine_id not in self._remote_agents:
+                with self._lock:
+                    if remote_engine_id not in self._remote_agents:
+                        if fut := self._handshake_futures.get(
+                                remote_engine_id) is None:
+                            fut = self._executor.submit(
+                                self._nixl_handshake, meta.remote_host,
+                                meta.remote_port)
+                            fut.add_done_callback(
+                                lambda f, eid=remote_engine_id: \
+                                self._handshake_futures.pop(eid))
+                            self._handshake_futures[remote_engine_id] = fut
+
+                        #TODO handle failure state of f in the callback,
+                        # we want to fail the request in this case.
+                        fut.add_done_callback(lambda f, entry=(req_id,meta): \
+                                                  self._ready_requests.put(entry))
+                        continue
+
+            self._read_blocks_for_req(req_id, meta)
+
+        # Start transfers for requests whose handshakes have now finished.
+        while not self._ready_requests.empty():
+            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+
+    def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
+        logger.debug(
+            "Remote agent %s available, calling _read_blocks for req %s",
+            meta.remote_engine_id, req_id)
+        self._read_blocks(
+            request_id=req_id,
+            dst_engine_id=meta.remote_engine_id,
+            local_block_ids=meta.local_block_ids,
+            remote_block_ids=meta.remote_block_ids,
+        )
 
     def _read_blocks(
         self,
         local_block_ids: list[int],
         remote_block_ids: list[int],
-        remote_host: str,
-        remote_port: int,
         dst_engine_id: str,
         request_id: str,
     ):
-        # NOTE(rob): this takes ~2s. We need to get this off the hotpath.
-        if dst_engine_id not in self._remote_agents:
-            self._nixl_handshake(remote_host, remote_port)
-
         # NOTE(rob): having the staging blocks be on the READER side is
         # not going to work well (since we will have to call rearrange tensors).
         # after we detect the txn is complete (which means we cannot make the
