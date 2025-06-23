@@ -391,7 +391,7 @@ class NixlConnectorWorker:
         # eng_id -> handshake future
         self._handshake_futures: dict[str, Future] = {}
         self._ready_requests = queue.Queue[tuple[str, ReqMeta]]()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
