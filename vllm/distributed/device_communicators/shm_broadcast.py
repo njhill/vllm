@@ -32,6 +32,7 @@ from vllm.utils import (
     get_open_zmq_ipc_path,
     is_valid_ipv6_address,
 )
+from vllm.v1.engine.utils import CpuGuard
 
 VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 
@@ -447,6 +448,7 @@ class MessageQueue:
         timeout: float | None = None,
         cancel: Event | None = None,
         indefinite: bool = False,
+        cpu_guard: CpuGuard | None = None,
     ):
         assert self._is_local_reader, "Only readers can acquire read"
         start_time = time.monotonic()
@@ -465,6 +467,8 @@ class MessageQueue:
                     # we need to wait until it is written
 
                     # Release the processor to other threads
+                    if cpu_guard is not None:
+                        cpu_guard.wait_for_idle(timeout=1.0)
                     self._read_spin_timer.spin()
 
                     if cancel is not None and cancel.is_set():
@@ -523,10 +527,11 @@ class MessageQueue:
         timeout: float | None = None,
         cancel: Event | None = None,
         indefinite: bool = False,
+        cpu_guard: CpuGuard | None = None,
     ):
         """Read from message queue with optional timeout (in seconds)"""
         if self._is_local_reader:
-            with self.acquire_read(timeout, cancel, indefinite) as buf:
+            with self.acquire_read(timeout, cancel, indefinite, cpu_guard) as buf:
                 overflow = buf[0] == 1
                 if not overflow:
                     # no need to know the size of serialized object

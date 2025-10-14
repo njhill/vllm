@@ -16,6 +16,7 @@ from vllm.executor.uniproc_executor import (  # noqa
 from vllm.executor.uniproc_executor import UniProcExecutor as UniProcExecutorV0  # noqa
 from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine.utils import NOOP_CPU_GUARD, CpuGuard
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
@@ -123,6 +124,9 @@ class Executor(ExecutorBase):
 
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start,))
+
+    def get_cpu_guard(self) -> CpuGuard:
+        return NOOP_CPU_GUARD
 
 
 class UniProcExecutor(UniProcExecutorV0, Executor):

@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import cloudpickle
 import torch
+from v1.engine.utils import NOOP_CPU_GUARD
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -45,6 +46,7 @@ from vllm.utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine.utils import ConditionCpuGuard, CpuGuard
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -63,6 +65,7 @@ class MultiprocExecutor(Executor):
         self.shutdown_event = threading.Event()
         self.failure_callback: FailureCallback | None = None
         self.io_thread_pool: ThreadPoolExecutor | None = None
+        self.cpu_guard = ConditionCpuGuard()
 
         self.world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
@@ -139,6 +142,9 @@ class MultiprocExecutor(Executor):
             self.io_thread_pool = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="mp_exec_io"
             )
+            self.cpu_guard = ConditionCpuGuard()
+        else:
+            self.cpu_guard = NOOP_CPU_GUARD
 
         self.output_rank = self._get_output_rank()
         self.has_connector = self.vllm_config.kv_transfer_config is not None
@@ -170,6 +176,9 @@ class MultiprocExecutor(Executor):
         Thread(
             target=monitor_workers, daemon=True, name="MultiprocWorkerMonitor"
         ).start()
+
+    def get_cpu_guard(self) -> CpuGuard:
+        return self.cpu_guard
 
     def register_failure_callback(self, callback: FailureCallback):
         if self.is_failed:
@@ -258,7 +267,9 @@ class MultiprocExecutor(Executor):
                 cancel_event: threading.Event | None = None,
             ):
                 status, result = w.worker_response_mq.dequeue(
-                    timeout=dequeue_timeout, cancel=cancel_event
+                    timeout=dequeue_timeout,
+                    cancel=cancel_event,
+                    cpu_guard=self.cpu_guard,
                 )
 
                 if status != WorkerProc.ResponseStatus.SUCCESS:
@@ -279,9 +290,12 @@ class MultiprocExecutor(Executor):
                         get_response, w, dequeue_timeout, self.shutdown_event
                     )
                     if not non_block:
-                        result = result.result()
+                        with self.cpu_guard:
+                            result = result.result()
+
                 elif not non_block:
-                    result = get_response(w, dequeue_timeout, self.shutdown_event)
+                    with self.cpu_guard:
+                        result = get_response(w, dequeue_timeout, self.shutdown_event)
                 else:
                     raise RuntimeError(
                         "non_block can only be used when max_concurrent_batches > 1"

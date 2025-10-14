@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import contextlib
 import os
+import threading
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -979,3 +979,53 @@ def wait_for_engine_startup(
             "local" if local else "remote",
             eng_index,
         )
+
+
+class CpuGuard:
+    """
+    For 'guarding' CPU use by the main scheduler thread.
+    Used to avoid contention with spin-waiting in other threads
+    (specifically when waiting on the shm broadcast queue for
+    worker responses).
+    """
+
+    def set_idle(self):
+        pass
+
+    def unset_idle(self):
+        pass
+
+    def wait_for_idle(self, timeout: float | None = None):
+        pass
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+NOOP_CPU_GUARD = CpuGuard()
+
+
+class ConditionCpuGuard(CpuGuard):
+    def __init__(self):
+        self.is_idle: bool = True
+        self.is_idle_cond = threading.Condition()
+
+    def set_idle(self):
+        with self.is_idle_cond:
+            self.is_idle = True
+            self.is_idle_cond.notify_all()
+
+    def unset_idle(self):
+        self.is_idle = False
+
+    def wait_for_idle(self, timeout: float | None = None):
+        self.is_idle_cond.wait_for(lambda: self.is_idle, timeout=timeout)
+
+    def __enter__(self):
+        self.set_idle()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.unset_idle()

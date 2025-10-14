@@ -169,6 +169,8 @@ class EngineCore:
             vllm_config, mm_registry
         )
 
+        self.cpu_guard = self.model_executor.get_cpu_guard()
+
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
@@ -386,9 +388,13 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
+        if not future.done():
+            self.cpu_guard.set_idle()
+
         model_output = self.execute_model_with_error_logging(
             lambda _: future.result(), scheduler_output
         )
+        self.cpu_guard.unset_idle()
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -787,6 +793,7 @@ class EngineCoreProc(EngineCore):
                 decorate_logs()
                 engine_core = EngineCoreProc(*args, **kwargs)
 
+            engine_core.cpu_guard.unset_idle()
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -801,6 +808,7 @@ class EngineCoreProc(EngineCore):
             raise e
         finally:
             if engine_core is not None:
+                engine_core.cpu_guard.set_idle()
                 engine_core.shutdown()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
@@ -828,7 +836,9 @@ class EngineCoreProc(EngineCore):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
+                self.cpu_guard.set_idle()
             req = self.input_queue.get()
+            self.cpu_guard.unset_idle()
             self._handle_client_request(*req)
 
         if waited:
