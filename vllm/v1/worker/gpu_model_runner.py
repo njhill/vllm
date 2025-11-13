@@ -422,9 +422,12 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.cuda.Event | None = None
+        self.mm_preproc_event: torch.cuda.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.cuda.Event()
+            if self.supports_mm_inputs:
+                self.mm_preproc_event = torch.cuda.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -2462,19 +2465,19 @@ class GPUModelRunner(
         )
 
     @contextmanager
-    def synchronize_input_prep(self):
-        if self.prepare_inputs_event is None:
+    def synchronize_async_cpu(self, event: torch.cuda.Event):
+        if event is None:
             yield
             return
 
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
+        event.synchronize()
         try:
             yield
         finally:
-            self.prepare_inputs_event.record()
+            event.record()
 
     def _model_forward(
         self,
@@ -2521,7 +2524,7 @@ class GPUModelRunner(
             )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
-            with self.synchronize_input_prep():
+            with self.synchronize_async_cpu(self.prepare_inputs_event):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
@@ -2602,16 +2605,17 @@ class GPUModelRunner(
                     scheduler_output.total_num_scheduled_tokens
                 )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_input_tokens, intermediate_tensors
-            )
+            with self.synchronize_async_cpu(self.mm_preproc_event):
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output, num_input_tokens, intermediate_tensors
+                )
 
             uniform_decode = (
                 max_num_scheduled_tokens == self.uniform_decode_query_len
