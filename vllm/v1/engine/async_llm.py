@@ -267,7 +267,7 @@ class AsyncLLM(EngineClient):
 
     async def add_request(
         self,
-        request_id: str,
+        request_id: str | None,
         prompt: EngineCoreRequest | PromptType,
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
@@ -324,11 +324,11 @@ class AsyncLLM(EngineClient):
         assert isinstance(parent_params, SamplingParams)
 
         # Fan out child requests (for n>1).
-        parent_request = ParentRequest(request_id, parent_params)
+        parent_request = ParentRequest(request, parent_params)
         for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
+            child_request_id, ext_id, child_params = parent_request.get_child_info(idx)
             child_request = request if idx == parent_params.n - 1 else copy(request)
-            child_request.request_id = request_id
+            child_request.request_id = child_request_id
             child_request.sampling_params = child_params
             await self._add_request(
                 child_request, prompt_text, parent_request, idx, queue
@@ -350,7 +350,7 @@ class AsyncLLM(EngineClient):
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
-            logger.info("Added request %s.", request.request_id)
+            logger.info("Added request %s.", request.ext_request_id)
 
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
@@ -445,9 +445,9 @@ class AsyncLLM(EngineClient):
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
         except (asyncio.CancelledError, GeneratorExit):
-            await self.abort(request_id)
+            await self.abort(request_id)  # TODO
             if self.log_requests:
-                logger.info("Request %s aborted.", request_id)
+                logger.info("Request %s aborted.", request_id)  # TODO
             raise
 
         # Engine is dead. Do not abort since we shut down.

@@ -72,6 +72,13 @@ class EngineCoreRequest(
 
     trace_headers: Mapping[str, str] | None = None
 
+    # If no external request id is provided, the internal request id is used.
+    _ext_request_id: str | None
+
+    @property
+    def ext_request_id(self) -> str:
+        return self.request_id if self._ext_request_id is None else self._ext_request_id
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

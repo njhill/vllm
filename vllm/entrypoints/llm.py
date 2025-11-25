@@ -1656,7 +1656,7 @@ class LLM:
 
     def _process_inputs(
         self,
-        request_id: str,
+        request_id: str | None,
         engine_prompt: PromptType,
         params: SamplingParams | PoolingParams,
         *,
@@ -1692,23 +1692,22 @@ class LLM:
         request_id = str(next(self.request_counter))
 
         engine_request, tokenization_kwargs = self._process_inputs(
-            request_id,
-            prompt,
-            params,
+            request_id=request_id,
+            engine_prompt=prompt,
+            params=params,
             lora_request=lora_request,
             priority=priority,
         )
 
-        self.llm_engine.add_request(
-            request_id,
-            engine_request,
-            params,
+        return self.llm_engine.add_request(
+            request_id=None,
+            prompt=engine_request,
+            params=params,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
             prompt_text=prompt_text,
         )
-        return request_id
 
     def _run_engine(
         self, *, use_tqdm: bool | Callable[..., tqdm] = True

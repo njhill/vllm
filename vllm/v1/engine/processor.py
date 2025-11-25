@@ -21,7 +21,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
-from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.metrics.stats import MultiModalCacheStats
 from vllm.v1.structured_output.backend_guidance import validate_guidance_grammar
@@ -385,7 +385,7 @@ class Processor:
 
     def process_inputs(
         self,
-        request_id: str,
+        request_id: str | None,
         prompt: PromptType,
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
@@ -410,6 +410,8 @@ class Processor:
         if arrival_time is None:
             arrival_time = time.time()
 
+        internal_req_id = random_uuid()
+
         # Optionally generate multimodal hash overrides to avoid hashing
         # multimodal data items by their content as their identifiers.
 
@@ -423,7 +425,7 @@ class Processor:
             and self.model_config.multimodal_config.mm_processor_cache_gb == 0
             and not self.cache_config.enable_prefix_caching
         ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
+            mm_uuids = self._maybe_build_mm_uuids(internal_req_id, prompt)
         else:
             # Otherwise, use user-provided uuids as multimodal hash overrides
             # if provided.
@@ -509,7 +511,7 @@ class Processor:
                 )
 
         return EngineCoreRequest(
-            request_id=request_id,
+            request_id=internal_req_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
@@ -522,6 +524,7 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            _ext_request_id=request_id,
         )
 
     def _validate_model_inputs(

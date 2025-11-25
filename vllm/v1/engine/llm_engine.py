@@ -212,7 +212,7 @@ class LLMEngine:
 
     def add_request(
         self,
-        request_id: str,
+        request_id: str | None,
         prompt: EngineCoreRequest | PromptType,
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
@@ -221,10 +221,12 @@ class LLMEngine:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         prompt_text: str | None = None,
-    ) -> None:
+    ) -> str:
         # Validate the request_id type.
-        if not isinstance(request_id, str):
-            raise TypeError(f"request_id must be a string, got {type(request_id)}")
+        if str is not None and not isinstance(request_id, str):
+            raise TypeError(
+                f"request_id must be a string if provided, got {type(request_id)}"
+            )
 
         # Process raw inputs into the request.
         if isinstance(prompt, EngineCoreRequest):
@@ -260,14 +262,15 @@ class LLMEngine:
             self.output_processor.add_request(request, prompt_text, None, 0)
             # Add the request to EngineCore.
             self.engine_core.add_request(request)
-            return
+            return request.request_id
 
         # Fan out child requests (for n>1).
-        parent_req = ParentRequest(request_id, params)
+        parent_req = ParentRequest(request, params)
         for idx in range(n):
-            request_id, child_params = parent_req.get_child_info(idx)
+            child_request_id, ext_id, child_params = parent_req.get_child_info(idx)
             child_request = request if idx == n - 1 else copy(request)
-            child_request.request_id = request_id
+            child_request.request_id = child_request_id
+            child_request._ext_request_id = ext_id
             child_request.sampling_params = child_params
 
             # Make a new RequestState and queue.
@@ -276,6 +279,8 @@ class LLMEngine:
             )
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
+
+        return parent_req.request_id
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:

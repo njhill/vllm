@@ -108,8 +108,10 @@ class RequestState:
         top_p: float | None = None,
         n: int | None = None,
         temperature: float | None = None,
+        ext_request_id: str = None,
     ):
         self.request_id = request_id
+        self.ext_request_id = ext_request_id
         self.parent_req = parent_req
         self.request_index = request_index
         self.lora_name = lora_name
@@ -122,10 +124,6 @@ class RequestState:
         )
         self.logprobs_processor = logprobs_processor
         self.detokenizer = detokenizer
-        self.max_tokens_param = max_tokens_param
-        self.top_p = top_p
-        self.n = n
-        self.temperature = temperature
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -135,6 +133,12 @@ class RequestState:
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
+
+        # These are stored solely for tracing span metadata.
+        self.max_tokens_param = max_tokens_param
+        self.top_p = top_p
+        self.n = n
+        self.temperature = temperature
 
     @classmethod
     def from_new_request(
@@ -176,6 +180,7 @@ class RequestState:
 
         return cls(
             request_id=request.request_id,
+            ext_request_id=request.ext_request_id,
             parent_req=parent_req,
             request_index=request_index,
             lora_name=(
@@ -236,9 +241,10 @@ class RequestState:
                 self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
 
         request_id = self.request_id
+        ext_request_id = self.ext_request_id
         if pooling_output is not None:
             return self._new_request_output(
-                request_id, [self._new_pooling_output(pooling_output)], finished
+                ext_request_id, [self._new_pooling_output(pooling_output)], finished
             )
 
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
@@ -246,14 +252,14 @@ class RequestState:
         if self.parent_req is None:
             outputs = [output]
         else:
-            request_id, outputs, finished = self.parent_req.get_outputs(
+            ext_request_id, outputs, finished = self.parent_req.get_outputs(
                 request_id, output
             )
             if not outputs:
                 return None
 
         return self._new_request_output(
-            request_id, outputs, finished, kv_transfer_params
+            ext_request_id, outputs, finished, kv_transfer_params
         )
 
     def _new_request_output(
@@ -593,7 +599,9 @@ class OutputProcessor:
             )
 
             # meta
-            span.set_attribute(SpanAttributes.GEN_AI_REQUEST_ID, req_state.request_id)
+            span.set_attribute(
+                SpanAttributes.GEN_AI_REQUEST_ID, req_state.ext_request_id
+            )
             if req_state.top_p:
                 span.set_attribute(SpanAttributes.GEN_AI_REQUEST_TOP_P, req_state.top_p)
             if req_state.max_tokens_param:

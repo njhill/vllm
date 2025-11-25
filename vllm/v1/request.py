@@ -44,8 +44,10 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        ext_request_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        self._ext_request_id = ext_request_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -184,6 +186,10 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def ext_request_id(self) -> str:
+        return self.request_id if self._ext_request_id is None else self._ext_request_id
 
     def get_skip_reading_prefix_cache(self) -> bool:
         if (

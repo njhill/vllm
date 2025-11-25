@@ -413,7 +413,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id,
+                            request.ext_request_id,
                         )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -1487,10 +1487,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
-            logger.debug("Finished recving KV transfer for request %s", req_id)
+            logger.debug("Finished recving KV transfer for request %s", req_id)  # TODO
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in kv_connector_output.finished_sending or ():
-            logger.debug("Finished sending KV transfer for request %s", req_id)
+            logger.debug("Finished sending KV transfer for request %s", req_id)  # TODO
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 

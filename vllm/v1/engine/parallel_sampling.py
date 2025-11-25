@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from copy import copy
-from typing import Optional, cast
+from typing import Optional
 
 from vllm.outputs import CompletionOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.metrics.stats import IterationStats
 
 
@@ -31,13 +32,16 @@ class ParentRequest:
     # To efficiently obtain child sampling params
     cached_child_sampling_params: SamplingParams | None
 
-    def __init__(self, request_id: str, sampling_params: SamplingParams) -> None:
-        self.request_id = request_id
+    def __init__(
+        self, request: EngineCoreRequest, sampling_params: SamplingParams
+    ) -> None:
+        self.request_id = request.request_id
+        self.ext_req_id = request._ext_req_id
         self.sampling_params = sampling_params
 
         self.child_requests = set()
         self.output_aggregator = (
-            [cast(CompletionOutput, None)] * sampling_params.n
+            [None] * sampling_params.n  # type: ignore[arg-type]
             if (sampling_params.output_kind == RequestOutputKind.FINAL_ONLY)
             else []
         )
@@ -75,7 +79,7 @@ class ParentRequest:
             child_sampling_params.seed = seed + index
         return child_sampling_params
 
-    def get_child_info(self, index: int) -> tuple[str, SamplingParams]:
+    def get_child_info(self, index: int) -> tuple[str, str | None, SamplingParams]:
         """Get child request ID and sampling params.
 
         Args:
@@ -85,8 +89,11 @@ class ParentRequest:
           (request ID, sampling_params) tuple
         """
         child_req_id = f"{index}_{self.request_id}"
+        chid_req_ext_id = (
+            None if self.ext_req_id is None else f"{index}_{self.ext_req_id}"
+        )
         self.child_requests.add(child_req_id)
-        return child_req_id, self._get_child_sampling_params(index)
+        return child_req_id, chid_req_ext_id, self._get_child_sampling_params(index)
 
     @property
     def n(self) -> int:
@@ -118,7 +125,8 @@ class ParentRequest:
             outputs = [] if self.child_requests else self.output_aggregator
 
         finished = not self.child_requests
-        return self.request_id, outputs, finished
+        request_id = self.request_id if self.ext_req_id is None else self.request_id
+        return request_id, outputs, finished
 
     def observe_num_generation_tokens(self, num_generation_tokens: int):
         self.max_num_generation_tokens = max(

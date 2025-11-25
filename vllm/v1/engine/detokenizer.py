@@ -173,7 +173,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         sampling_params = request.sampling_params
         assert sampling_params is not None
 
-        self.request_id = request.request_id
+        self.ext_request_id = request.ext_request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
         self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
 
@@ -248,7 +248,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             logger.warning(
                 "Encountered invalid prefix detokenization error"
                 " for request %s, resetting decode stream.",
-                self.request_id,
+                self.ext_request_id,
             )
             self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
             token = self.stream.step(self.tokenizer, next_token_id)
