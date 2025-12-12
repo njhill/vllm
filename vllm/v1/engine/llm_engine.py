@@ -26,6 +26,7 @@ from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils import new_internal_request_id
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
@@ -238,7 +239,10 @@ class LLMEngine:
         # Process raw inputs into the request.
         if isinstance(prompt, EngineCoreRequest):
             request = prompt
-            if request_id != request.request_id:
+            if not request.external_req_id:
+                request.external_req_id = request.request_id
+
+            if request_id != request.external_req_id:
                 logger.warning_once(
                     "AsyncLLM.add_request() was passed a request_id parameter that "
                     "does not match the EngineCoreRequest.request_id attribute. The "
@@ -260,6 +264,11 @@ class LLMEngine:
                 prompt_text = prompt
             elif isinstance(prompt, Mapping):
                 prompt_text = cast(str | None, prompt.get("prompt"))
+
+        if not request.external_req_id:
+            request.external_req_id = request.request_id
+
+        request.request_id = new_internal_request_id(request.external_req_id)
 
         # Use cloned params that may have been updated in process_inputs()
         params = request.params

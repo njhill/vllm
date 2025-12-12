@@ -30,6 +30,7 @@ from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils import new_internal_request_id
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.utils.math_utils import cdiv
@@ -292,7 +293,10 @@ class AsyncLLM(EngineClient):
         # Convert Input --> Request.
         if isinstance(prompt, EngineCoreRequest):
             request = prompt
-            if request_id != request.request_id:
+            if not request.external_req_id:
+                request.external_req_id = request.request_id
+
+            if request_id != request.external_req_id:
                 logger.warning_once(
                     "AsyncLLM.add_request() was passed a request_id parameter that "
                     "does not match the EngineCoreRequest.request_id attribute. The "
@@ -315,6 +319,8 @@ class AsyncLLM(EngineClient):
                 prompt_text = prompt
             elif isinstance(prompt, Mapping):
                 prompt_text = cast(str | None, prompt.get("prompt"))
+
+        request.request_id = new_internal_request_id(request.external_req_id)
 
         # Create a new output collector for the request.
         queue = RequestOutputCollector(params.output_kind, request.request_id)

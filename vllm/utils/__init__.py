@@ -42,6 +42,13 @@ def random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
 
 
+def new_internal_request_id(request_id: str):
+    """Construct an internal request ID by adding 8 random characters
+    to the supplied request ID in order to ensure uniqueness.
+    """
+    return f"{request_id}-{random_uuid():.8}"
+
+
 def length_from_prompt_token_ids_or_embeds(
     prompt_token_ids: list[int] | None,
     prompt_embeds: torch.Tensor | None,
