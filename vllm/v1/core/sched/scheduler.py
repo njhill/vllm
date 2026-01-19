@@ -873,23 +873,24 @@ class Scheduler(SchedulerInterface):
         """
         Updates the waiting session with the next streaming update.
 
-        Removes the last output token (not yet scheduled) from `_all_token_ids`
-        because the new request's prompt tokens will replace it. Typically the decoded
-        outputs are scheduled as the next input in autoregressive decoding. When we
-        receive a new streaming request, the new prompt becomes our next input, so the
-        last output token is no longer needed and will not join the kv cache. This
-        ensures correct calculation of `num_new_tokens` in `schedule`.
+        Discards all output tokens from `_all_token_ids` since they have already
+        been returned to the user and should not be part of the next sub-request's
+        prompt. The KV cache entries for these tokens become orphaned but this is
+        acceptable. Resets `num_computed_tokens` to reflect just the accumulated
+        prompt tokens (which are still valid in the KV cache).
         """
         if update is None:
             # Streaming-input request finished.
             self.finish_requests(session.request_id, RequestStatus.FINISHED_ABORTED)
             return
 
-        num_new_tokens = session.num_tokens - session.num_computed_tokens
-        assert num_new_tokens in (0, 1), f"got {num_new_tokens=}"
-        if num_new_tokens == 1:
-            assert session._all_token_ids[-1] == session._output_token_ids[-1]
-            del session._all_token_ids[-1]
+        # Discard output tokens - they've been returned to user but shouldn't
+        # be part of the next sub-request's context. KV cache for these tokens
+        # becomes orphaned.
+        old_prompt_len = session.num_prompt_tokens
+        del session._all_token_ids[old_prompt_len:]
+        session._output_token_ids.clear()
+        session.num_computed_tokens = old_prompt_len
 
         if update.mm_features:
             base = session.num_tokens
@@ -903,6 +904,10 @@ class Scheduler(SchedulerInterface):
         if session.prompt_token_ids is None:
             session.prompt_token_ids = []
         session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        # Update block hashes for the new tokens
+        # (mirrors Request.append_output_token_ids)
+        if session.get_hash_new_full_blocks is not None:
+            session.block_hashes.extend(session.get_hash_new_full_blocks())
         if session.prompt_embeds is not None and update.prompt_embeds is not None:
             session.prompt_embeds = torch.cat(
                 (session.prompt_embeds, update.prompt_embeds)
@@ -1264,7 +1269,12 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             routed_experts = None
+            finish_reason = None
             if stopped:
+                # Capture finish_reason BEFORE _handle_stopped_request, which may
+                # reset the status to WAITING for streaming requests that continue.
+                finish_reason = request.get_finished_reason()
+
                 if self.vllm_config.model_config.enable_return_routed_experts:
                     kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
                     block_ids = kv_blocks.get_block_ids()[0]
@@ -1291,6 +1301,7 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
@@ -1327,7 +1338,7 @@ class Scheduler(SchedulerInterface):
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
-                        finish_reason=request.get_finished_reason(),
+                        finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
