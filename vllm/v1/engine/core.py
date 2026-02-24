@@ -17,6 +17,7 @@ from typing import Any, TypeVar, cast
 import msgspec
 import zmq
 
+from vllm import PoolingParams, SamplingParams, envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -213,6 +214,9 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
+        if envs.VLLM_USE_V2_MODEL_RUNNER:
+            self.warmup_workers()
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -281,6 +285,36 @@ class EngineCore:
             scope="local",
         )
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+
+    def warmup_workers(self) -> None:
+        """Warm up Model Runner V2 runtime triton kernels and tensor allocations."""
+
+        prompt_tok_ids = [0, 1]
+        scheduler_config = self.vllm_config.scheduler_config
+        # Run two separate batches of requests.
+        num_reqs = scheduler_config.max_num_seqs * 2
+        if self.vllm_config.model_config.runner_type == "pooling":
+            pooling_params = PoolingParams()
+            sampling_params = None
+        else:
+            struct_outputs_config = self.vllm_config.structured_outputs_config
+            sampling_params = SamplingParams.for_sampler_warmup(struct_outputs_config)
+            pooling_params = None
+
+        # Disable prefix caching and kv connectors for warmup run.
+        with self.scheduler.disable_kv_caching():  # type: ignore[attr-defined]
+            for req_id in range(num_reqs):
+                request = Request(
+                    f"_warmup_{req_id}", prompt_tok_ids, sampling_params, pooling_params
+                )
+                self.structured_output_manager.grammar_init(request)
+                self.scheduler.add_request(request)
+            self.model_executor.collective_rpc("disable_kv_connector", args=(True,))
+            # Run steps to complete warmup batch.
+            while self.scheduler.has_requests() or self.batch_queue:
+                _, model_executed = self.step_fn()
+                self.post_step(model_executed)
+            self.model_executor.collective_rpc("disable_kv_connector", args=(False,))
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks

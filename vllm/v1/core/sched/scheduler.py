@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import itertools
 import time
 from collections import defaultdict, deque
@@ -1850,6 +1851,20 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    @contextlib.contextmanager
+    def disable_kv_caching(self):
+        """Temporarily disable prefix cache and kv connector."""
+
+        connector = self.connector
+        cache_enabled = self.kv_cache_manager.enable_caching
+        self.connector = None
+        self.kv_cache_manager.enable_caching = False
+        try:
+            yield
+        finally:
+            self.connector = connector
+            self.kv_cache_manager.enable_caching = cache_enabled
 
     def make_stats(
         self,
