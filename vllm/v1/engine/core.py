@@ -1214,7 +1214,7 @@ class EngineCoreProc(EngineCore):
         if self.shutdown_state == EngineShutdownState.REQUESTED:
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
-            logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
+            logger.info("Core shutdown initiated")
 
             if shutdown_timeout == 0:
                 num_requests = self.scheduler.get_num_unfinished_requests()
@@ -1237,7 +1237,7 @@ class EngineCoreProc(EngineCore):
 
         # Exit when no work remaining
         if not self.has_work():
-            logger.info("Shutdown complete")
+            logger.debug("Core shutdown complete.")
             return False
 
         return True

@@ -435,7 +435,7 @@ class MultiprocExecutor(Executor):
     def shutdown(self):
         """Properly shut down the executor and its workers"""
         if not getattr(self, "shutting_down", False):
-            logger.debug("Triggering shutdown of workers")
+            logger.info("Triggering shutdown of workers")
             self.shutting_down = True
 
             # Make sure all the worker processes are terminated first.
@@ -756,7 +756,7 @@ class WorkerProc:
                 # This will block until parent process exits (pipe closes)
                 death_pipe.recv()
             except EOFError:
-                logger.info_once("Parent process exited, terminating worker queues")
+                logger.debug("Received shutdown signal or parent died.")
                 shutdown_requested.set()
                 for mq in queues_to_shutdown:
                     if mq is not None:
