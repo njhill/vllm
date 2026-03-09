@@ -77,7 +77,6 @@ class CudaGraphManager:
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
     ):
         self.vllm_config = vllm_config
@@ -85,16 +84,28 @@ class CudaGraphManager:
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
         assert self.compilation_config is not None
-        self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.dp_size = vllm_config.parallel_config.data_parallel_size
 
+        # cudagraph mode and sizes will be set in set_cudagraph_mode_and_sizes
+        # after init_attn_backend resolves the final cudagraph mode.
+        self.cudagraph_mode = CUDAGraphMode.NONE
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
-        self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+        self.pool = None
 
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+
+    def set_cudagraph_mode_and_sizes(self) -> None:
+        """Set the resolved cudagraph mode and build candidate lists.
+
+        Must be called after init_attn_backend has resolved the final
+        cudagraph mode in compilation_config.
+        """
+        self.cudagraph_mode = self.compilation_config.cudagraph_mode
+        if self.cudagraph_mode != CUDAGraphMode.NONE:
+            self.pool = current_platform.get_global_graph_pool()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -259,10 +270,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
     ):
-        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+        super().__init__(vllm_config, device, decode_query_len)
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False

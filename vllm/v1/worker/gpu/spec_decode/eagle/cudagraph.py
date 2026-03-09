@@ -25,22 +25,26 @@ class EagleCudaGraphManager(CudaGraphManager):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        cudagraph_mode: CUDAGraphMode,
         draft_tokens: torch.Tensor,
     ):
-        assert not cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE), (
-            "EagleCudaGraphManager does not support PIECEWISE mode yet"
-        )
         # Eagle always uses uniform decode with query_len=1
-        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len=1)
+        super().__init__(vllm_config, device, decode_query_len=1)
         self.draft_tokens = draft_tokens
 
+    def set_cudagraph_mode_and_sizes(self) -> None:
+        """Set the resolved cudagraph mode for Eagle (decode mode only)."""
+        # NOTE(woosuk): For Eagle, we only use CUDA graphs for decode.
+        self.cudagraph_mode = self.compilation_config.cudagraph_mode.decode_mode()
+        assert not self.cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE), (
+            "EagleCudaGraphManager does not support PIECEWISE mode yet"
+        )
         # Use a dedicated pool for Eagle to avoid memory overlap with the main
         # model's cudagraph. The base class uses a shared global pool, but Eagle's
         # internal allocations (e.g., gumbel_sample temporaries) can conflict with
         # the main model's allocations when sharing the same pool.
-        if cudagraph_mode:
+        if self.cudagraph_mode:
             self.pool = torch.cuda.graph_pool_handle()
+        self._init_candidates()
 
     def capture(
         self,
