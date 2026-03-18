@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
+from collections.abc import Callable
+
 import torch
 
 from vllm.distributed import (
@@ -154,6 +156,62 @@ class LogitsProcessor(CustomOp):
         max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
         top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
         return top_tokens.squeeze(-1).to(torch.int64)
+
+    def sample_from_hidden_states(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        sample_fn: "Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]",
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fused logits + sampling without all-gathering full logits.
+
+        Generalizes get_top_tokens (greedy argmax) to random sampling
+        via Gumbel-Max. Each TP rank computes local Gumbel-Max on its
+        vocab shard, then a lightweight cross-rank reduction picks the
+        global winner.
+
+        Args:
+            sample_fn: (logits_local) -> (gumbel_max_values, token_indices)
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+
+        # Compute logits on local shard (no TP gather).
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+
+        # Mask out padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        # Tiled Gumbel-Max on local shard.
+        local_max_vals, local_max_indices = sample_fn(logits)
+
+        # Convert shard-local indices to global vocab indices.
+        local_max_indices = (
+            local_max_indices + lm_head.shard_indices.org_vocab_start_index
+        )
+
+        if tp_size == 1:
+            return local_max_indices
+
+        # All-gather (value, index) pairs, then reduce to global argmax.
+        local_pair = torch.stack(
+            [local_max_vals.float(), local_max_indices.float()], dim=-1
+        )
+        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
+        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+        return (
+            gathered[:, :, 1]
+            .gather(dim=-1, index=max_rank_idx)
+            .squeeze(-1)
+            .to(torch.int64)
+        )
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"

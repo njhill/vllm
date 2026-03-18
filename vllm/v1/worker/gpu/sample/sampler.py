@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
@@ -8,8 +12,15 @@ import vllm.envs as envs
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.flash_sample import flash_sample_kernel
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
@@ -53,6 +64,65 @@ class Sampler:
         self.penalties_state.apply_staged_writes()
         self.logit_bias_state.apply_staged_writes()
         self.bad_words_state.apply_staged_writes()
+
+    def can_flash_sample(self, input_batch: InputBatch) -> bool:
+        """Check if the batch is eligible for the flash sampling fast path.
+
+        Returns False if any request requires logprobs, penalties, logit bias,
+        bad words, top_k, or top_p (which needs a full-distribution CDF).
+        """
+        idx_mapping_np = input_batch.idx_mapping_np
+        if self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS:
+            return False
+        if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
+            return False
+        if np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np]):
+            return False
+        if int(self.bad_words_state.num_bad_words.np[idx_mapping_np].max()) > 0:
+            return False
+        vocab_size = self.sampling_states.vocab_size
+        if np.any(self.sampling_states.top_k.np[idx_mapping_np] != vocab_size):
+            return False
+        return not np.any(self.sampling_states.top_p.np[idx_mapping_np] != 1.0)
+
+    def flash_sample(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        logits_processor: LogitsProcessor,
+        lm_head: VocabParallelEmbedding,
+    ) -> SamplerOutput:
+        """Fast path: fused logits + sampling via Gumbel-Max."""
+        expanded_idx_mapping = input_batch.expanded_idx_mapping
+        idx_mapping_np = input_batch.idx_mapping_np
+        pos = input_batch.positions[input_batch.logits_indices]
+        temperature = self.sampling_states.temperature.gpu
+        min_p = self.sampling_states.min_p.gpu
+        seeds = self.sampling_states.seeds.gpu
+        has_min_p = not np.all(self.sampling_states.min_p.np[idx_mapping_np] == 0.0)
+
+        def sample_fn(
+            local_logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return flash_sample_kernel(
+                local_logits,
+                expanded_idx_mapping,
+                temperature,
+                min_p,
+                seeds,
+                pos,
+                has_min_p,
+            )
+
+        sampled = logits_processor.sample_from_hidden_states(
+            lm_head, sample_hidden_states, sample_fn
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
+        )
 
     def __call__(
         self,

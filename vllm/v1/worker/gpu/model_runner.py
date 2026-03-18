@@ -303,6 +303,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
 
+        # Check if the model supports flash sampling (fused logits + sample).
+        self._init_flash_sample()
+
+    def _init_flash_sample(self) -> None:
+        """Probe the model for flash sampling support."""
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        self._flash_sample_enabled = False
+        if not self.is_last_pp_rank or self.sampler is None:
+            return
+        logits_processor = getattr(self.model, "logits_processor", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        if (
+            logits_processor is not None
+            and lm_head is not None
+            and isinstance(logits_processor, LogitsProcessor)
+        ):
+            self._flash_sample_enabled = True
+            logger.info("Flash sampling enabled for this model.")
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -799,6 +819,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+
+        # Try flash sampling fast path: fused logits + Gumbel-Max sampling
+        # without materializing full [B, V] logits tensor.
+        if (
+            self._flash_sample_enabled
+            and grammar_output is None
+            and input_batch.num_draft_tokens == 0
+            and self.sampler is not None
+            and self.sampler.can_flash_sample(input_batch)
+        ):
+            sampler_output = self.sampler.flash_sample(
+                sample_hidden_states,
+                input_batch,
+                self.model.logits_processor,
+                self.model.lm_head,
+            )
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                sampler_output.num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.req_states.prefill_len.gpu,
+            )
+            return sampler_output, num_sampled, num_rejected
+
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
