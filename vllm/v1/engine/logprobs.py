@@ -47,9 +47,7 @@ class LogprobsProcessor:
     ) -> "LogprobsProcessor":
         sampling_params = request.sampling_params
         assert sampling_params is not None
-        num_logprobs = sampling_params.logprobs
-        if num_logprobs is None and sampling_params.logprob_token_ids:
-            num_logprobs = len(sampling_params.logprob_token_ids)
+        num_logprobs = sampling_params.num_logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
         return cls(
             tokenizer=tokenizer,

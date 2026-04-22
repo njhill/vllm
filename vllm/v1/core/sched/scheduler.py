@@ -1444,10 +1444,7 @@ class Scheduler(SchedulerInterface):
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
-                and (
-                    request.sampling_params.logprobs is not None
-                    or request.sampling_params.logprob_token_ids
-                )
+                and request.sampling_params.num_logprobs is not None
                 and logprobs
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
