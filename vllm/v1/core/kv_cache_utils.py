@@ -686,13 +686,13 @@ def get_request_block_hasher(
     return request_block_hasher
 
 
-def _check_enough_kv_cache_memory(
-    available_memory: int,
-    get_needed_memory: Callable[[], int],
+def _check_enough_kv_cache_blocks(
+    pool_blocks: int,
+    blocks_needed: int,
     max_model_len: int,
     estimate_max_model_len: Callable[[int], int],
 ):
-    if available_memory <= 0:
+    if pool_blocks <= 0:
         raise ValueError(
             "No available memory for the cache blocks. "
             "Try increasing `gpu_memory_utilization` when initializing the engine. "
@@ -700,24 +700,22 @@ def _check_enough_kv_cache_memory(
             "for more details."
         )
 
-    needed_memory = get_needed_memory()
-
-    if needed_memory > available_memory:
-        estimated_max_len = estimate_max_model_len(available_memory)
+    if blocks_needed > pool_blocks:
+        estimated_max_len = estimate_max_model_len(pool_blocks)
         estimated_msg = ""
         if estimated_max_len > 0:
             estimated_msg = (
-                "Based on the available memory, "
+                "Based on the allocated KV cache, "
                 f"the estimated maximum model length is {estimated_max_len}. "
             )
 
         raise ValueError(
-            f"To serve at least one request with the models's max seq len "
-            f"({max_model_len}), ({format_gib(needed_memory)} GiB KV "
-            f"cache is needed, which is larger than the available KV cache "
-            f"memory ({format_gib(available_memory)} GiB). {estimated_msg}"
-            f"Try increasing `gpu_memory_utilization` or decreasing `max_model_len` "
-            f"when initializing the engine. "
+            f"To serve at least one request with the model's max seq len "
+            f"({max_model_len}), {blocks_needed} KV cache blocks are needed, "
+            f"which is larger than the allocated pool size ({pool_blocks} "
+            f"blocks). {estimated_msg}"
+            f"Try increasing `gpu_memory_utilization` or `num_gpu_blocks_override`, "
+            f"or decreasing `max_model_len` when initializing the engine. "
             f"See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
             f"for more details."
         )
@@ -805,12 +803,38 @@ def check_enough_kv_cache_memory(
     """
 
     # No need to check for available memory if the kv_cache_spec is empty
-    if kv_cache_spec:
-        _check_enough_kv_cache_memory(
-            available_memory,
-            lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
-            vllm_config.model_config.max_model_len,
-            lambda am: estimate_max_model_len(vllm_config, kv_cache_spec, am),
+    if not kv_cache_spec:
+        return
+
+    if available_memory <= 0:
+        raise ValueError(
+            "No available memory for the cache blocks. "
+            "Try increasing `gpu_memory_utilization` when initializing the engine. "
+            "See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
+            "for more details."
+        )
+
+    needed_memory = max_memory_usage_bytes(vllm_config, kv_cache_spec.values())
+    if needed_memory > available_memory:
+        max_model_len = vllm_config.model_config.max_model_len
+        estimated_max_len = estimate_max_model_len(
+            vllm_config, kv_cache_spec, available_memory
+        )
+        estimated_msg = ""
+        if estimated_max_len > 0:
+            estimated_msg = (
+                "Based on the available memory, "
+                f"the estimated maximum model length is {estimated_max_len}. "
+            )
+        raise ValueError(
+            f"To serve at least one request with the model's max seq len "
+            f"({max_model_len}), ({format_gib(needed_memory)} GiB KV cache "
+            f"is needed, which is larger than the available KV cache memory "
+            f"({format_gib(available_memory)} GiB). {estimated_msg}"
+            f"Try increasing `gpu_memory_utilization` or decreasing `max_model_len` "
+            f"when initializing the engine. "
+            f"See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
+            f"for more details."
         )
 
 
@@ -909,30 +933,47 @@ def may_override_num_blocks(
     return num_blocks
 
 
-def get_num_blocks(
+def _pool_blocks_from_memory(
     vllm_config: VllmConfig,
-    num_layers: int,
+    kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
-    page_size: int,
     suppress_log: bool = False,
 ) -> int:
     """
-    Get the number of kv cache blocks.
+    Number of blocks the worker's shared block pool will hold for the given
+    groups + available memory, after applying `num_gpu_blocks_override`.
 
-    Args:
-        vllm_config: The global VllmConfig
-        num_layers: The number of layers
-        available_memory: Memory available for KV cache in bytes.
-        page_size: The page size of the KV cache.
-        suppress_log: Whether to suppress override log messages. Used when creating a
-            temporary/dummy KV cache config, e.g. during CG memory profiling
+    Mirrors the per-path divisor logic in `get_kv_cache_config_from_groups` so
+    that auto-fit / admission checks against this value match the count that
+    will actually be allocated.
     """
-    num_blocks = int(available_memory // page_size // num_layers)
-    num_blocks = max(num_blocks, 0)
-    num_blocks = may_override_num_blocks(
-        vllm_config, num_blocks, suppress_log=suppress_log
-    )
-    return num_blocks
+    if not kv_cache_groups:
+        return 1
+
+    if len(kv_cache_groups) == 1 and isinstance(
+        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    ):
+        bytes_per_block = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    elif all(
+        isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
+    ):
+        # DeepseekV4: shared layout sized by the largest per-page-size bucket.
+        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        layer_tuple_page_bytes = sum(full_mla_spec.get_page_sizes())
+        num_layer_tuples = max(
+            cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).get_num_layer_tuples()
+            for g in kv_cache_groups
+        )
+        bytes_per_block = layer_tuple_page_bytes * num_layer_tuples
+    else:
+        group_size = max(len(g.layer_names) for g in kv_cache_groups)
+        page_size = get_uniform_page_size(
+            [g.kv_cache_spec for g in kv_cache_groups]
+        )
+        bytes_per_block = page_size * group_size
+
+    num_blocks = max(int(available_memory) // bytes_per_block, 0)
+    return may_override_num_blocks(vllm_config, num_blocks, suppress_log=suppress_log)
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -1159,11 +1200,10 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
-def _get_kv_cache_config_deepseek_v4(
-    vllm_config: VllmConfig,
+def _get_kv_cache_tensors_deepseek_v4(
     kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> tuple[int, list[KVCacheTensor]]:
+    num_blocks: int,
+) -> list[KVCacheTensor]:
     """DeepseekV4 KV cache tensor layout planning.
 
     Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
@@ -1179,7 +1219,6 @@ def _get_kv_cache_config_deepseek_v4(
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
-    layer_tuple_page_bytes = sum(page_sizes)
 
     # Pre-bucket each group's layers by page_size (registration order within
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
@@ -1198,9 +1237,6 @@ def _get_kv_cache_config_deepseek_v4(
     # this equals the sub-group size (each has a single page_size).
     num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-
     kv_cache_tensors: list[KVCacheTensor] = []
     for tuple_idx in range(num_layer_tuples):
         for ps in page_sizes:
@@ -1213,7 +1249,7 @@ def _get_kv_cache_config_deepseek_v4(
                 KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
             )
 
-    return num_blocks, kv_cache_tensors
+    return kv_cache_tensors
 
 
 def get_kv_cache_config_from_groups(
@@ -1242,6 +1278,10 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    num_blocks = _pool_blocks_from_memory(
+        vllm_config, kv_cache_groups, available_memory, suppress_log=suppress_log
+    )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1249,12 +1289,6 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        )
-        num_blocks = may_override_num_blocks(
-            vllm_config, num_blocks, suppress_log=suppress_log
-        )
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(
@@ -1269,8 +1303,8 @@ def get_kv_cache_config_from_groups(
     ):
         # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
         # Delegate to the DeepseekV4-specific allocator.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
-            vllm_config, kv_cache_groups, available_memory
+        kv_cache_tensors = _get_kv_cache_tensors_deepseek_v4(
+            kv_cache_groups, num_blocks
         )
     else:
         # General case:
@@ -1282,17 +1316,8 @@ def get_kv_cache_config_from_groups(
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
-
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
-        )
-        assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config,
-            group_size,
-            available_memory,
-            page_size,
-            suppress_log=suppress_log,
         )
         kv_cache_tensors = []
         for i in range(group_size):
@@ -1722,16 +1747,18 @@ def _report_kv_cache_config(
     )
 
 
-def _max_memory_usage_bytes_from_groups(
+def _max_blocks_per_request_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """
-    Calculate maximum memory usage in bytes from KV cache groups.
+    Number of blocks needed in the worker's shared block pool to hold one
+    request at the current `max_model_len`.
 
-    This correctly accounts for padding in hybrid models. For example, if a
-    model has 8 full attention layers and 9 sliding window layers, they will
-    be padded to 9 full + 9 sliding window for uniform group sizes.
+    Mirrors the per-path geometry of `_pool_blocks_from_memory` so that
+    `blocks_needed <= pool_blocks` is the exact admission constraint for
+    a single request, including hybrid (full + sliding-window / chunked-local)
+    models where each group consumes pool slots at a different rate per token.
     """
     if not kv_cache_groups:
         return 0
@@ -1739,68 +1766,54 @@ def _max_memory_usage_bytes_from_groups(
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
-        # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
-        per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        return sum(
-            spec.max_memory_usage_bytes(vllm_config)
-            for spec in per_layer_specs.values()
-        )
-    elif all(
+        # Single uniform-type group: every layer needs the same number of
+        # slots, so the constraint is just that page count.
+        return cast(
+            UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec
+        ).max_memory_usage_pages(vllm_config)
+
+    if all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
     ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
-            for group in kv_cache_groups
+        # DeepseekV4: groups consume pool slots independently in the shared
+        # padded layout.
+        return sum(
+            cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).max_memory_usage_pages(
+                vllm_config
+            )
+            for g in kv_cache_groups
         )
 
-        total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
-            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            g_max_mem_usage_page_bytes = (
-                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
-            )
-            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
-
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    # General hybrid case: each group needs its own block count in the shared
+    # pool. SWA / chunked-local groups need fewer blocks per token than full
+    # attention groups because their `max_memory_usage_bytes` accounts for the
+    # bounded effective context length.
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
-    blocks_needed = sum(
+    return sum(
         cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
         for group in kv_cache_groups
     )
-
-    return group_size * page_size * blocks_needed
 
 
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
+    pool_blocks: int,
 ) -> int:
     """
-    Binary search for the maximum model length that fits in available memory.
-    Returns 0 if even 1 token doesn't fit.
+    Binary search for the maximum model length that fits in `pool_blocks`
+    pool slots. Returns 0 if even 1 token doesn't fit.
     """
     original_max = vllm_config.model_config.max_model_len
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
         return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-            <= available_memory
+            _max_blocks_per_request_from_groups(vllm_config, kv_cache_groups)
+            <= pool_blocks
         )
 
     try:
@@ -1823,19 +1836,19 @@ def _estimate_max_model_len_from_groups(
 def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
-    available_memory: list[int],
+    pool_blocks_per_worker: list[int],
 ) -> None:
     """
     When max_model_len is set to -1, this function estimates the largest
-    context length that can be supported with the available GPU memory.
+    context length that can be supported by the allocated KV cache pool.
     It uses binary search to find the maximum length that fits across all
     workers.
 
     Args:
         vllm_config: The global VllmConfig (will be modified in-place)
         projected_groups_per_worker: KV cache groups projected to each worker.
-        available_memory: Memory available for KV cache in bytes for each
-            worker.
+        pool_blocks_per_worker: Number of allocated pool blocks (after
+            `num_gpu_blocks_override`) for each worker.
     """
     original_max = vllm_config.model_config.max_model_len
 
@@ -1850,37 +1863,42 @@ def _auto_fit_max_model_len(
 
     # Find the max_model_len that fits across all workers.
     auto_fit_max = original_max
-    limiting_worker_mem = available_memory[0]
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    limiting_pool_blocks = pool_blocks_per_worker[0]
+    for groups, pool_blocks in zip(
+        projected_groups_per_worker, pool_blocks_per_worker
+    ):
         if not groups:
             continue
-        worker_max = _estimate_max_model_len_from_groups(vllm_config, groups, avail_mem)
+        worker_max = _estimate_max_model_len_from_groups(
+            vllm_config, groups, pool_blocks
+        )
         if worker_max < auto_fit_max:
             auto_fit_max = worker_max
-            limiting_worker_mem = avail_mem
+            limiting_pool_blocks = pool_blocks
 
     if auto_fit_max <= 0:
         raise ValueError(
-            "Cannot auto-fit max_model_len: not enough GPU memory available "
-            "to serve even a single token. Try increasing `gpu_memory_utilization`."
+            "Cannot auto-fit max_model_len: not enough KV cache available "
+            "to serve even a single token. Try increasing `gpu_memory_utilization` "
+            "or `num_gpu_blocks_override`."
         )
 
     if auto_fit_max >= original_max:
-        # The model's full context length fits in memory
+        # The model's full context length fits in the allocated pool.
         logger.info_once(
             "Auto-fit max_model_len: full model context length %d fits in "
-            "available GPU memory",
+            "the allocated KV cache",
             original_max,
         )
     else:
-        # Need to reduce max_model_len to fit in memory
+        # Need to reduce max_model_len to fit in the allocated pool.
         vllm_config.model_config.max_model_len = auto_fit_max
         logger.info_once(
             "Auto-fit max_model_len: reduced from %d to %d to fit in "
-            "available GPU memory (%s GiB available for KV cache)",
+            "the allocated KV cache (%d pool blocks available)",
             original_max,
             auto_fit_max,
-            format_gib(limiting_worker_mem),
+            limiting_pool_blocks,
         )
 
 
@@ -1988,18 +2006,30 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
+    # Compute the actual pool block count per worker (after applying
+    # `num_gpu_blocks_override`). Auto-fit and admission checks use these
+    # block counts so they reflect the cache that will actually be allocated.
+    # The downstream `get_kv_cache_config_from_groups` call recomputes the
+    # same value; suppress the override log here to avoid duplicate output.
+    pool_blocks_per_worker = [
+        _pool_blocks_from_memory(vllm_config, groups, avail_mem, suppress_log=True)
+        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+    ]
+
     if vllm_config.model_config.original_max_model_len == -1:
         _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
+            vllm_config, projected_groups_per_worker, pool_blocks_per_worker
         )
 
-    # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    # Check if the allocated pool is enough per worker.
+    for groups, pool_blocks in zip(
+        projected_groups_per_worker, pool_blocks_per_worker
+    ):
         if not groups:
             continue
-        _check_enough_kv_cache_memory(
-            avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+        _check_enough_kv_cache_blocks(
+            pool_blocks,
+            _max_blocks_per_request_from_groups(vllm_config, groups),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
