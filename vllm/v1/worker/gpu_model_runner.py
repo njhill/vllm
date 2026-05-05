@@ -3469,12 +3469,19 @@ class GPUModelRunner(
             if prev.sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
                 prev.sampled_token_ids = sampled_token_ids
-            prev.req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                if i not in invalid_req_indices_set
-                and not self.requests[req_id].is_final_step()
-            }
+            prev.req_id_to_index = self._build_continuing_req_id_to_index()
+
+            # PP+async: broadcast the sampled tokens to non-last ranks now that
+            # we know which requests will consume them. (For torchrun
+            # external_launcher PP mode with broadcast_pp_output=True, PP
+            # outputs are already broadcast at logits computation.)
+            pp = get_pp_group()
+            if (
+                pp.world_size > 1
+                and not self.broadcast_pp_output
+                and prev.req_id_to_index
+            ):
+                self._pp_broadcast_prev_sampled_token_ids(sampled_token_ids)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -4239,15 +4246,6 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
-        if self.use_async_scheduling:
-            pp = get_pp_group()
-            # For torchrun external_launcher PP mode with broadcast_pp_output=True,
-            # PP outputs have been broadcasted to all ranks at logits computation.
-            # Therefore, here is no need to send sampled token ids again in this case.
-            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
-                )
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -4429,55 +4427,64 @@ class GPUModelRunner(
 
         return async_output
 
+    def _build_continuing_req_id_to_index(self) -> dict[str, int]:
+        """req_id -> batch row mapping for requests that will appear in the
+        next iteration (i.e., not discarded, not generating their final token).
+        Must be called BEFORE this iteration's sampled-token placeholder is
+        appended to `output_token_ids`.
+        """
+        num_reqs = self.input_batch.num_reqs
+        discard_mask = self.discard_request_mask.np[:num_reqs]
+        return {
+            req_id: i
+            for i, req_id in enumerate(self.input_batch.req_ids)
+            if not discard_mask[i]
+            and not self.requests[req_id].is_final_step()
+        }
+
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Broadcast sampled token ids (GPU) from last PP stage."""
         pp = get_pp_group()
         assert pp.is_last_rank
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+        # `sampled_token_ids` is expected to have shape [num_reqs, 1].
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
-            )
+        torch.distributed.broadcast(
+            sampled_token_ids, src=pp.rank, group=pp.device_group
+        )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         prev = self.input_batch.prev
         assert prev is not None
-        prev.sampled_token_ids = recv
 
-        # construct `req_id_to_index` here so `_prepare_input_ids`
-        # can map req_id -> previous batch row
-        discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
-        discard_req_indices_set = set(discard_req_indices)
-        prev_req_id_to_index: dict[str, int] = {}
+        # Build `req_id_to_index` BEFORE appending this step's placeholder;
+        # this also serves as the broadcast guard (the sender skips when the
+        # mapping is empty).
+        prev.req_id_to_index = self._build_continuing_req_id_to_index()
+
+        # PP+async scheduling: advance per-request local cached output length
+        # by appending a placeholder (-1) token id.
+        discard_mask = self.discard_request_mask.np[:num_reqs]
         for i, req_id in enumerate(self.input_batch.req_ids):
-            if i in discard_req_indices_set:
-                continue
-            req_state = self.requests.get(req_id)
-            # Skip requests that just hit max_tokens; they won't appear in
-            # the next batch.
-            if req_state is None or not req_state.is_final_step():
-                prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output
-            # length by appending a placeholder (-1) token id.
-            if req_state is not None:
-                req_state.output_token_ids.append(-1)
-        prev.req_id_to_index = prev_req_id_to_index
+            if not discard_mask[i]:
+                self.requests[req_id].output_token_ids.append(-1)
+
+        if not prev.req_id_to_index:
+            # Sender skipped the broadcast.
+            prev.sampled_token_ids = None
+            return
+
+        # `sampled_token_ids` is expected to have shape [num_reqs, 1].
+        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        prev.sampled_token_ids = recv
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
