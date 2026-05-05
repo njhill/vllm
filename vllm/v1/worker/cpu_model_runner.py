@@ -194,9 +194,9 @@ class CPUModelRunner(GPUModelRunner):
         counts = valid_sampled_tokens_count
         counts_cpu = self.valid_sampled_token_count_cpu
         counts_cpu[: counts.shape[0]].copy_(counts)
-        self.input_batch.prev_sampled_tokens[
-            self.input_batch.pp_stream_index
-        ].prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+        prev = self.input_batch.prev
+        assert prev is not None
+        prev.sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
         """CPU-safe version: no event synchronization needed."""

@@ -3464,13 +3464,12 @@ class GPUModelRunner(
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            prev = self.input_batch.prev_sampled_tokens[
-                self.input_batch.pp_stream_index
-            ]
-            if prev.prev_sampled_token_ids is None:
+            prev = self.input_batch.prev
+            assert prev is not None
+            if prev.sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
-                prev.prev_sampled_token_ids = sampled_token_ids
-            prev.prev_req_id_to_index = {
+                prev.sampled_token_ids = sampled_token_ids
+            prev.req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
@@ -4253,10 +4252,8 @@ class GPUModelRunner(
         self._draft_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
-        if (prev_sampled_tokens := self.input_batch.prev_sampled_tokens) is not None:
-            prev_sampled_tokens[
-                self.input_batch.pp_stream_index
-            ].prev_sampled_token_ids = None
+        if (prev := self.input_batch.prev) is not None:
+            prev.sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -4459,10 +4456,11 @@ class GPUModelRunner(
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        prev = self.input_batch.prev_sampled_tokens[self.input_batch.pp_stream_index]
-        prev.prev_sampled_token_ids = recv
+        prev = self.input_batch.prev
+        assert prev is not None
+        prev.sampled_token_ids = recv
 
-        # construct `prev_req_id_to_index` here so `_prepare_input_ids`
+        # construct `req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
@@ -4479,7 +4477,7 @@ class GPUModelRunner(
             # length by appending a placeholder (-1) token id.
             if req_state is not None:
                 req_state.output_token_ids.append(-1)
-        prev.prev_req_id_to_index = prev_req_id_to_index
+        prev.req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
@@ -4551,9 +4549,9 @@ class GPUModelRunner(
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
-        self.input_batch.prev_sampled_tokens[
-            self.input_batch.pp_stream_index
-        ].prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+        prev = self.input_batch.prev
+        assert prev is not None
+        prev.sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
         # Wait until valid_sampled_tokens_count is copied to cpu,

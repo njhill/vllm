@@ -32,8 +32,8 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 @dataclass
 class PrevSampledTokens:
-    prev_sampled_token_ids: torch.Tensor | None = None
-    prev_req_id_to_index: dict[str, int] | None = None
+    sampled_token_ids: torch.Tensor | None = None
+    req_id_to_index: dict[str, int] | None = None
 
 
 @dataclass
@@ -334,18 +334,22 @@ class InputBatch:
         return cast(list[str], self._req_ids)
 
     @property
-    def prev_sampled_token_ids(self) -> torch.Tensor | None:
-        """Sampled token tensor cached for the current pipeline-parallel slot."""
+    def prev(self) -> PrevSampledTokens | None:
+        """State cached from the previous step's sampling for the current
+        pipeline-parallel slot. None when async scheduling is disabled."""
         if self.prev_sampled_tokens is None:
             return None
-        return self.prev_sampled_tokens[self.pp_stream_index].prev_sampled_token_ids
+        return self.prev_sampled_tokens[self.pp_stream_index]
+
+    @property
+    def prev_sampled_token_ids(self) -> torch.Tensor | None:
+        """Convenience accessor for `self.prev.sampled_token_ids`."""
+        return self.prev.sampled_token_ids if self.prev else None
 
     @property
     def prev_req_id_to_index(self) -> dict[str, int] | None:
-        """Req-id -> row mapping cached for the current pipeline-parallel slot."""
-        if self.prev_sampled_tokens is None:
-            return None
-        return self.prev_sampled_tokens[self.pp_stream_index].prev_req_id_to_index
+        """Convenience accessor for `self.prev.req_id_to_index`."""
+        return self.prev.req_id_to_index if self.prev else None
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
@@ -594,8 +598,8 @@ class InputBatch:
         self.logprob_token_ids.pop(req_id, None)
         if self.prev_sampled_tokens is not None:
             for prev in self.prev_sampled_tokens:
-                if prev.prev_req_id_to_index is not None:
-                    prev.prev_req_id_to_index.pop(req_id, None)
+                if prev.req_id_to_index is not None:
+                    prev.req_id_to_index.pop(req_id, None)
 
         self.has_allowed_token_ids.discard(req_id)
         if self.allowed_token_ids_mask_cpu_tensor is not None:
