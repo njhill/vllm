@@ -351,6 +351,18 @@ class InputBatch:
         """Convenience accessor for `self.prev.req_id_to_index`."""
         return self.prev.req_id_to_index if self.prev else None
 
+    def advance_pp_index(self) -> None:
+        """Advance the pipeline-parallel stream slot. Should be called once
+        per `execute_model` call so that step T writes/reads the slot that
+        step T + pp_size will read again. No-op when async scheduling is
+        disabled.
+        """
+        if self.prev_sampled_tokens is None:
+            return
+        self.pp_stream_index = (self.pp_stream_index + 1) % len(
+            self.prev_sampled_tokens
+        )
+
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
         Not applicable to pooling models.

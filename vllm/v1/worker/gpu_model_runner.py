@@ -3868,12 +3868,8 @@ class GPUModelRunner(
         # Advance the pipeline-parallel stream slot. Reads/writes of
         # `prev_sampled_tokens` within this step (and the associated
         # `sample_tokens` call) target the same slot, which is read again
-        # `pipeline_parallel_size` steps later. Only relevant for async
-        # scheduling; otherwise `prev_sampled_tokens` is None.
-        if (prev_sampled_tokens := self.input_batch.prev_sampled_tokens) is not None:
-            self.input_batch.pp_stream_index = (
-                self.input_batch.pp_stream_index + 1
-            ) % len(prev_sampled_tokens)
+        # `pipeline_parallel_size` steps later.
+        self.input_batch.advance_pp_index()
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
