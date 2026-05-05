@@ -95,7 +95,12 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids_dict: dict[int, set[str]] | None = (
             defaultdict(set) if include_finished_set else None
         )
-        self.prev_step_scheduled_req_ids: set[str] = set()
+        # Rolling history of decode-scheduled (excl. non-final prefill chunks)
+        # req ids; slot 0 corresponds to step T-pp_size (the matching PP slot).
+        pp_size = self.parallel_config.pipeline_parallel_size
+        self.prev_scheduled_req_ids: deque[set[str]] = deque(
+            (set() for _ in range(pp_size)), maxlen=pp_size
+        )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -347,21 +352,33 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            if (
-                request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
-            ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
-                req_index += 1
-                continue
+            if request.num_output_placeholders > 0:
+                if (
+                    # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
+                    # Since output placeholders are also included in the computed tokens
+                    # count, we subtract (num_output_placeholders - 1) to remove any
+                    # draft tokens, so that we can be sure no further steps are needed
+                    # even if they are all rejected.
+                    request.num_computed_tokens + 2 - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    # Async scheduling: Avoid scheduling an extra step when we are sure
+                    # that the previous step has reached request.max_tokens. We don't
+                    # schedule partial draft tokens since this prevents uniform decode
+                    # optimizations.
+                    req_index += 1
+                    continue
+
+                if (
+                    self.use_pp
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                ):
+                    # PP+async: the sampled token from a decode step isn't available
+                    # to feed back as input until pp_size steps later, so throttle
+                    # decode scheduling for a request to once per cycle. Prefill
+                    # chunks are exempt because they don't depend on previous output.
+                    req_index += 1
+                    continue
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -855,10 +872,6 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
-        # Record the request ids that were scheduled in this step.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
-
         new_block_ids_to_zero = (
             (self.kv_cache_manager.take_new_block_ids() or None)
             if self.needs_kv_cache_zeroing
@@ -900,6 +913,16 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # Record this step's decode schedulings; auto-pops the oldest slot.
+        # `is_prefill_chunk` is set by `_update_after_schedule` above.
+        self.prev_scheduled_req_ids.append(
+            {
+                req_id
+                for req_id in num_scheduled_tokens
+                if not self.requests[req_id].is_prefill_chunk
+            }
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1014,6 +1037,9 @@ class Scheduler(SchedulerInterface):
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
 
+        # Reqs whose sample is still available via the matching PP slot.
+        prev_scheduled = self.prev_scheduled_req_ids[0]
+
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
@@ -1034,19 +1060,19 @@ class Scheduler(SchedulerInterface):
                     req.num_computed_tokens : req.num_computed_tokens + num_tokens
                 ]
                 new_token_ids.append(token_ids)
-            scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
-            if idx >= num_running_reqs:
-                assert not scheduled_in_prev_step
+            is_resumed = idx >= num_running_reqs
+            if is_resumed:
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            cur_num_output_tokens = req.num_output_tokens + req.num_output_placeholders
+            # Send authoritative token ids when the worker may not have complete
+            # output_token_ids on cpu. Needed only for V1 model runner.
+            if cur_num_output_tokens and (is_resumed or req_id not in prev_scheduled):
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
             num_computed_tokens.append(req.num_computed_tokens)
-            num_output_tokens.append(
-                req.num_output_tokens + req.num_output_placeholders
-            )
+            num_output_tokens.append(cur_num_output_tokens)
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1822,7 +1848,8 @@ class Scheduler(SchedulerInterface):
             # + resumption in the same step, we must act as if these requests were
             # not scheduled in the prior step. They will be flushed from the
             # persistent batch in the model runner.
-            self.prev_step_scheduled_req_ids.clear()
+            for prev in self.prev_scheduled_req_ids:
+                prev.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:

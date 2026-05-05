@@ -31,6 +31,14 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 
 @dataclass
+class PrevSampledTokens:
+    """Stores sampled tokens tensor from a prior step."""
+
+    sampled_token_ids: torch.Tensor | None = None
+    req_id_to_index: dict[str, int] | None = None
+
+
+@dataclass
 class CachedRequestState:
     req_id: str
     prompt_token_ids: list[int] | None
@@ -87,6 +95,16 @@ class CachedRequestState:
             return self.output_token_ids[idx - self.num_prompt_tokens]
         return -1
 
+    def is_final_step(self) -> bool:
+        """True when the just-sampled token is this request's final output
+        token (i.e. appending it would hit `max_tokens`). Called BEFORE that
+        token / placeholder is appended to `output_token_ids`.
+        """
+        sampling_params = self.sampling_params
+        if sampling_params is None or sampling_params.max_tokens is None:
+            return False
+        return len(self.output_token_ids) + 1 >= sampling_params.max_tokens
+
 
 class InputBatch:
     def __init__(
@@ -106,6 +124,8 @@ class InputBatch:
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
+        pipeline_parallel_size: int = 1,
+        async_scheduling: bool = False,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
@@ -291,9 +311,14 @@ class InputBatch:
         self.pooling_params: dict[str, PoolingParams] = {}
         self.pooling_states: dict[str, PoolingStates] = {}
 
-        # Cached reference to the GPU tensor of previously sampled tokens
-        self.prev_sampled_token_ids: torch.Tensor | None = None
-        self.prev_req_id_to_index: dict[str, int] | None = None
+        # Cached references to GPU tensors of previously sampled tokens, one
+        # per in-flight pipeline stage.
+        self.prev_sampled_tokens: list[PrevSampledTokens] | None = (
+            [PrevSampledTokens() for _ in range(pipeline_parallel_size)]
+            if async_scheduling
+            else None
+        )
+        self.pp_stream_index: int = -1
         # These are used to update output_token_ids with real sampled
         # ids from prior step, if required by current sampling params
         # (e.g. penalties).
@@ -305,6 +330,35 @@ class InputBatch:
         # None elements should only be present transiently
         # while performing state updates to the batch.
         return cast(list[str], self._req_ids)
+
+    @property
+    def prev(self) -> PrevSampledTokens | None:
+        """State cached from the previous step's sampling for the current
+        pipeline-parallel slot. None when async scheduling is disabled."""
+        if self.prev_sampled_tokens is None:
+            return None
+        return self.prev_sampled_tokens[self.pp_stream_index]
+
+    @property
+    def prev_sampled_token_ids(self) -> torch.Tensor | None:
+        """Convenience accessor for `self.prev.sampled_token_ids`."""
+        return self.prev.sampled_token_ids if self.prev else None
+
+    @property
+    def prev_req_id_to_index(self) -> dict[str, int] | None:
+        """Convenience accessor for `self.prev.req_id_to_index`."""
+        return self.prev.req_id_to_index if self.prev else None
+
+    def advance_pp_index(self) -> None:
+        """Advance the pipeline-parallel stream slot. Should be called once
+        per `execute_model` call so that step T writes/reads the slot that
+        step T + pp_size will read again.
+        """
+        if self.prev_sampled_tokens is None:
+            return
+        self.pp_stream_index = (self.pp_stream_index + 1) % len(
+            self.prev_sampled_tokens
+        )
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
@@ -552,8 +606,9 @@ class InputBatch:
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.logprob_token_ids.pop(req_id, None)
-        if self.prev_req_id_to_index is not None:
-            self.prev_req_id_to_index.pop(req_id, None)
+        for prev in self.prev_sampled_tokens or ():
+            if prev.req_id_to_index is not None:
+                prev.req_id_to_index.pop(req_id, None)
 
         self.has_allowed_token_ids.discard(req_id)
         if self.allowed_token_ids_mask_cpu_tensor is not None:
@@ -1026,10 +1081,11 @@ class InputBatch:
             # Output token ids not needed or not async scheduling.
             return
 
-        assert self.prev_req_id_to_index is not None
+        prev_req_id_to_index = self.prev_req_id_to_index
+        assert prev_req_id_to_index is not None
         sampled_token_ids = None
         for index, req_id in enumerate(self.req_ids):
-            prev_index = self.prev_req_id_to_index.get(req_id)
+            prev_index = prev_req_id_to_index.get(req_id)
             if prev_index is None:
                 continue
             req_output_token_ids = output_token_ids[index]
@@ -1063,13 +1119,14 @@ class InputBatch:
         real draft token ids from prior step. This is called right before they are
         needed by the rejection sampler for penalty/bad_words computation.
         """
-        if not draft_token_ids or not self.prev_req_id_to_index:
+        prev_req_id_to_index = self.prev_req_id_to_index
+        if not draft_token_ids or not prev_req_id_to_index:
             return
 
         if (spec_token_ids := self.sampling_metadata.spec_token_ids) is not None:
             for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
                 if spec_ids:
-                    prev_index = self.prev_req_id_to_index.get(req_id)
+                    prev_index = prev_req_id_to_index.get(req_id)
                     if prev_index is not None:
                         draft_ids = draft_token_ids[prev_index]
                         if draft_ids:
