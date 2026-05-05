@@ -405,6 +405,19 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                self.parallel_config.pipeline_parallel_size > 1
+                and request.num_output_placeholders > 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                # PP+async: the sampled token from a decode step isn't available
+                # to feed back as input until pp_size steps later, so throttle
+                # decode scheduling for a request to once per cycle. Prefill
+                # chunks are exempt because they don't depend on a previous
+                # step's sampled output.
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
