@@ -3469,7 +3469,12 @@ class GPUModelRunner(
             if prev.sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
                 prev.sampled_token_ids = sampled_token_ids
-            prev.req_id_to_index = self._build_continuing_req_id_to_index()
+            prev.req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids)
+                if i not in invalid_req_indices_set
+                and not self.requests[req_id].is_final_step()
+            }
 
             # PP+async: broadcast the sampled tokens to non-last ranks now that
             # we know which requests will consume them. (For torchrun
@@ -4427,21 +4432,6 @@ class GPUModelRunner(
 
         return async_output
 
-    def _build_continuing_req_id_to_index(self) -> dict[str, int]:
-        """req_id -> batch row mapping for requests that will appear in the
-        next iteration (i.e., not discarded, not generating their final token).
-        Must be called BEFORE this iteration's sampled-token placeholder is
-        appended to `output_token_ids`.
-        """
-        num_reqs = self.input_batch.num_reqs
-        discard_mask = self.discard_request_mask.np[:num_reqs]
-        return {
-            req_id: i
-            for i, req_id in enumerate(self.input_batch.req_ids)
-            if not discard_mask[i]
-            and not self.requests[req_id].is_final_step()
-        }
-
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
@@ -4464,19 +4454,23 @@ class GPUModelRunner(
         prev = self.input_batch.prev
         assert prev is not None
 
-        # Build `req_id_to_index` BEFORE appending this step's placeholder;
-        # this also serves as the broadcast guard (the sender skips when the
-        # mapping is empty).
-        prev.req_id_to_index = self._build_continuing_req_id_to_index()
-
-        # PP+async scheduling: advance per-request local cached output length
-        # by appending a placeholder (-1) token id.
+        # Build `req_id_to_index` and advance per-request local cached output
+        # length by appending a placeholder (-1) token id. Must build the
+        # mapping BEFORE appending so `is_final_step()` accounts for the
+        # about-to-be-added token. The mapping also serves as the broadcast
+        # guard (the sender skips when it would be empty).
         discard_mask = self.discard_request_mask.np[:num_reqs]
+        prev_req_id_to_index: dict[str, int] = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
-            if not discard_mask[i]:
-                self.requests[req_id].output_token_ids.append(-1)
+            if discard_mask[i]:
+                continue
+            req_state = self.requests[req_id]
+            if not req_state.is_final_step():
+                prev_req_id_to_index[req_id] = i
+            req_state.output_token_ids.append(-1)
+        prev.req_id_to_index = prev_req_id_to_index
 
-        if not prev.req_id_to_index:
+        if not prev_req_id_to_index:
             # Sender skipped the broadcast.
             prev.sampled_token_ids = None
             return
