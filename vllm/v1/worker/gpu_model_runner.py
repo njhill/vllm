@@ -1633,25 +1633,17 @@ class GPUModelRunner(
         # PP+async: receive the sampled tokens broadcast `pp_size` steps ago
         # by the last PP rank. The receive is guarded by `prev.req_id_to_index`
         # (recorded at the same step the matching broadcast was issued, which
-        # is `pp_size` steps ago since the PP slot has cycled back).
-        if (
-            self.use_async_scheduling
-            and not self.broadcast_pp_output
-            and (pp := get_pp_group()).world_size > 1
-            and not pp.is_last_rank
-        ):
+        # is `pp_size` steps ago since the PP slot has cycled back). The
+        # receive buffer was pre-allocated at that same step.
+        pp = get_pp_group()
+        if self.use_async_scheduling and not self.broadcast_pp_output and not pp.last_rank:
             prev = self.input_batch.prev
             assert prev is not None
             if prev.req_id_to_index:
-                recv = torch.empty(
-                    (prev.num_reqs, 1), dtype=torch.int32, device=self.device
-                )
+                assert prev.sampled_token_ids is not None
                 torch.distributed.broadcast(
-                    recv, src=pp.last_rank, group=pp.device_group
+                    prev.sampled_token_ids, src=pp.last_rank, group=pp.device_group
                 )
-                prev.sampled_token_ids = recv
-            else:
-                prev.sampled_token_ids = None
 
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         if prev_sampled_token_ids is None:
@@ -3498,7 +3490,6 @@ class GPUModelRunner(
                 if i not in invalid_req_indices_set
                 and not self.requests[req_id].is_final_step()
             }
-            prev.num_reqs = num_sampled_tokens
 
             # PP+async: broadcast the sampled tokens to non-last ranks now that
             # we know which requests will consume them. (For torchrun
@@ -4494,7 +4485,16 @@ class GPUModelRunner(
                     prev_req_id_to_index[req_id] = i
                 req_state.output_token_ids.append(-1)
         prev.req_id_to_index = prev_req_id_to_index
-        prev.num_reqs = num_reqs
+        # Pre-allocate the receive buffer if the sender will broadcast (i.e.
+        # any req in the next iteration will consume the sampled tokens).
+        # Sized to the current iteration's batch — which matches the sender's
+        # broadcast tensor shape — and consumed by `_prepare_input_ids`
+        # `pp_size` steps from now.
+        prev.sampled_token_ids = (
+            torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            if prev_req_id_to_index
+            else None
+        )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
