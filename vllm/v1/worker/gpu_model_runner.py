@@ -647,7 +647,7 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
             pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
-            async_scheduling=self.use_async_scheduling,
+            async_scheduling=bool(self.use_async_scheduling),
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -1636,7 +1636,11 @@ class GPUModelRunner(
         # is `pp_size` steps ago since the PP slot has cycled back). The
         # receive buffer was pre-allocated at that same step.
         pp = get_pp_group()
-        if self.use_async_scheduling and not self.broadcast_pp_output and not pp.last_rank:
+        if (
+            self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and not pp.last_rank
+        ):
             prev = self.input_batch.prev
             assert prev is not None
             if prev.req_id_to_index:
@@ -6608,7 +6612,7 @@ class GPUModelRunner(
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
                 pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
-                async_scheduling=self.use_async_scheduling,
+                async_scheduling=bool(self.use_async_scheduling),
             )
 
         assert self._init_block_sizes == block_sizes, (
