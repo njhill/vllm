@@ -596,10 +596,9 @@ class InputBatch:
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.logprob_token_ids.pop(req_id, None)
-        if self.prev_sampled_tokens is not None:
-            for prev in self.prev_sampled_tokens:
-                if prev.req_id_to_index is not None:
-                    prev.req_id_to_index.pop(req_id, None)
+        for prev in self.prev_sampled_tokens or ():
+            if prev.req_id_to_index is not None:
+                prev.req_id_to_index.pop(req_id, None)
 
         self.has_allowed_token_ids.discard(req_id)
         if self.allowed_token_ids_mask_cpu_tensor is not None:

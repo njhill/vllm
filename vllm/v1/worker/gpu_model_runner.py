@@ -3480,12 +3480,8 @@ class GPUModelRunner(
             # we know which requests will consume them. (For torchrun
             # external_launcher PP mode with broadcast_pp_output=True, PP
             # outputs are already broadcast at logits computation.)
-            pp = get_pp_group()
-            if (
-                pp.world_size > 1
-                and not self.broadcast_pp_output
-                and prev.req_id_to_index
-            ):
+            pp = get_pp_group().world_size > 1
+            if pp and not self.broadcast_pp_output and prev.req_id_to_index:
                 self._pp_broadcast_prev_sampled_token_ids(sampled_token_ids)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
@@ -4457,17 +4453,16 @@ class GPUModelRunner(
         # Build `req_id_to_index` and advance per-request local cached output
         # length by appending a placeholder (-1) token id. Must build the
         # mapping BEFORE appending so `is_final_step()` accounts for the
-        # about-to-be-added token. The mapping also serves as the broadcast
-        # guard (the sender skips when it would be empty).
-        discard_mask = self.discard_request_mask.np[:num_reqs]
+        # about-to-be-added token.
+        discard_mask = self.discard_request_mask.np[:num_reqs].tolist()
         prev_req_id_to_index: dict[str, int] = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
             if discard_mask[i]:
                 continue
-            req_state = self.requests[req_id]
-            if not req_state.is_final_step():
-                prev_req_id_to_index[req_id] = i
-            req_state.output_token_ids.append(-1)
+            if (req_state := self.requests.get(req_id)) is not None:
+                if not req_state.is_final_step():
+                    prev_req_id_to_index[req_id] = i
+                req_state.output_token_ids.append(-1)
         prev.req_id_to_index = prev_req_id_to_index
 
         if not prev_req_id_to_index:
