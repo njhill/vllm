@@ -646,6 +646,8 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
+            pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
+            async_scheduling=self.use_async_scheduling,
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -1254,9 +1256,10 @@ class GPUModelRunner(
                         (req_id, optimistic_num_accepted, req_state)
                     )
 
+                    prev_req_id_to_index = self.input_batch.prev_req_id_to_index
                     prev_req_index = (
-                        self.input_batch.prev_req_id_to_index.get(req_id)
-                        if self.input_batch.prev_req_id_to_index
+                        prev_req_id_to_index.get(req_id)
+                        if prev_req_id_to_index
                         else None
                     )
                     if prev_req_index is not None:
@@ -1627,7 +1630,8 @@ class GPUModelRunner(
         (-1 for new requests).
         """
 
-        if self.input_batch.prev_sampled_token_ids is None:
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        if prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
@@ -1696,7 +1700,7 @@ class GPUModelRunner(
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
             self.input_ids.gpu[:num_common_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
+                prev_sampled_token_ids[:num_common_tokens, 0],
                 non_blocking=True,
             )
             if self.enable_prompt_embeds:
@@ -1712,9 +1716,7 @@ class GPUModelRunner(
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
-            ],
+            src=prev_sampled_token_ids[prev_common_req_indices_tensor, 0],
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
@@ -3462,13 +3464,17 @@ class GPUModelRunner(
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
+            prev = self.input_batch.prev_sampled_tokens[
+                self.input_batch.pp_stream_index
+            ]
+            if prev.prev_sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.input_batch.prev_req_id_to_index = {
+                prev.prev_sampled_token_ids = sampled_token_ids
+            prev.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
+                and not self.requests[req_id].is_final_step()
             }
 
         # Cache the sampled tokens in the model runner, so that the scheduler
@@ -3832,6 +3838,16 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        # Advance the pipeline-parallel stream slot. Reads/writes of
+        # `prev_sampled_tokens` within this step (and the associated
+        # `sample_tokens` call) target the same slot, which is read again
+        # `pipeline_parallel_size` steps later. Only relevant for async
+        # scheduling; otherwise `prev_sampled_tokens` is None.
+        if (prev_sampled_tokens := self.input_batch.prev_sampled_tokens) is not None:
+            self.input_batch.pp_stream_index = (
+                self.input_batch.pp_stream_index + 1
+            ) % len(prev_sampled_tokens)
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -4237,7 +4253,10 @@ class GPUModelRunner(
         self._draft_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
-        self.input_batch.prev_sampled_token_ids = None
+        if (prev_sampled_tokens := self.input_batch.prev_sampled_tokens) is not None:
+            prev_sampled_tokens[
+                self.input_batch.pp_stream_index
+            ].prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -4440,7 +4459,8 @@ class GPUModelRunner(
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+        prev = self.input_batch.prev_sampled_tokens[self.input_batch.pp_stream_index]
+        prev.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -4450,12 +4470,16 @@ class GPUModelRunner(
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:
                 continue
-            prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
-            if (req_state := self.requests.get(req_id)) is not None:
+            req_state = self.requests.get(req_id)
+            # Skip requests that just hit max_tokens; they won't appear in
+            # the next batch.
+            if req_state is None or not req_state.is_final_step():
+                prev_req_id_to_index[req_id] = i
+            # PP+async scheduling: advance per-request local cached output
+            # length by appending a placeholder (-1) token id.
+            if req_state is not None:
                 req_state.output_token_ids.append(-1)
-        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+        prev.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
@@ -4527,7 +4551,9 @@ class GPUModelRunner(
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
-        self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+        self.input_batch.prev_sampled_tokens[
+            self.input_batch.pp_stream_index
+        ].prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
         # Wait until valid_sampled_tokens_count is copied to cpu,
@@ -6566,6 +6592,8 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
+                pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
+                async_scheduling=self.use_async_scheduling,
             )
 
         assert self._init_block_sizes == block_sizes, (
