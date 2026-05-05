@@ -34,6 +34,11 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 class PrevSampledTokens:
     sampled_token_ids: torch.Tensor | None = None
     req_id_to_index: dict[str, int] | None = None
+    # Batch size at the time `req_id_to_index` was constructed. Used when
+    # allocating the receive buffer for the deferred broadcast on non-last
+    # PP ranks (where the buffer's shape must match the sender's iteration
+    # that produced the data).
+    num_reqs: int = 0
 
 
 @dataclass
