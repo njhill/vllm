@@ -892,6 +892,7 @@ class GroupCoordinator:
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
+        current_stream = None
 
         handles: list[Handle] = []
         for key, tensor in zip(tensor_keys, tensor_list):
@@ -908,7 +909,9 @@ class GroupCoordinator:
                 tensor, dst=self.ranks[dst], group=comm_group
             )
             if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                if current_stream is None:
+                    current_stream = torch.cuda.current_stream(tensor.device)
+                tensor.record_stream(current_stream)
             handles.append(handle)
 
         return handles
