@@ -841,13 +841,17 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        current_stream = None
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
-            current_stream = torch.cuda.current_stream(self.device)
-            for t in intermediate_tensors.tensors.values():
-                t.record_stream(current_stream)
+            if intermediate_tensors is not None:
+                # Ensure tensors allocated on recv stream aren't reallocated
+                # prematurely.
+                current_stream = torch.cuda.current_stream(self.device)
+                for t in intermediate_tensors.tensors.values():
+                    t.record_stream(current_stream)
 
             if (
                 self.use_v2_model_runner
@@ -867,8 +871,13 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        if current_stream is None:
+            current_stream = torch.cuda.current_stream(self.device)
+
         # launch non-blocking send of intermediate tensors
         with torch.cuda.stream(self._pp_send_stream):
+            assert self._pp_send_stream is not None
+            self._pp_send_stream.wait_stream(current_stream)
             self._pp_send_work = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=get_tp_group(),
