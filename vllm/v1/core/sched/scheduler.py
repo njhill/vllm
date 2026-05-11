@@ -242,6 +242,8 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        # Scheduler iter counter; drives V2+PP decode throttle cadence.
+        self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -308,6 +310,7 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -367,12 +370,10 @@ class Scheduler(SchedulerInterface):
                 if (
                     self.use_pp
                     and self.use_v2_model_runner
-                    and request.num_computed_tokens >= request.num_tokens
+                    and self.current_step < request.next_decode_eligible_step
                 ):
-                    # PP+async: the sampled token from a decode step isn't available
-                    # to feed back as input until pp_size steps later, so throttle
-                    # decode scheduling for a request to once per cycle. Prefill
-                    # chunks are exempt because they don't depend on previous output.
+                    # V2+PP+async: enforce pp_size steps between same-req decodes
+                    # to match the worker-side broadcast slot ring cadence.
                     req_index += 1
                     continue
 

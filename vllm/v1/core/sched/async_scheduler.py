@@ -14,10 +14,12 @@ class AsyncScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+        self.pp_size = self.parallel_config.pipeline_parallel_size
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        pp_throttle = self.pp_size > 1 and self.use_v2_model_runner
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -33,6 +35,9 @@ class AsyncScheduler(Scheduler):
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders
+
+            if pp_throttle:
+                request.next_decode_eligible_step = self.current_step + self.pp_size
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
