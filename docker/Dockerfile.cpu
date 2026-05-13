@@ -126,12 +126,11 @@ ENV VLLM_REQUIRE_RUST_FRONTEND=1
 
 COPY . .
 
-# Fail loudly if the rust submodule was not initialized on the host before
-# `docker build`. The rust frontend source is brought in via `COPY . .`, so an
-# uninitialized submodule would otherwise produce a confusing cargo failure.
+# Fail loudly if the vendored rust frontend source is missing. The rust
+# frontend source is brought in via `COPY . .`, so a missing source tree would
+# otherwise produce a confusing cargo failure.
 RUN if [ ! -f rust/Cargo.toml ]; then \
-        echo "ERROR: rust/ submodule is not initialized."; \
-        echo "Run 'git submodule update --init --recursive' on the host before building."; \
+        echo "ERROR: rust/ frontend source is missing."; \
         exit 1; \
     fi
 

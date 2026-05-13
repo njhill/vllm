@@ -104,7 +104,6 @@ ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
 	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
 	    && git checkout FETCH_HEAD \
-	    && git submodule update --init --recursive \
         && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
                git remote add upstream "https://github.com/vllm-project/vllm.git" \
                && git fetch upstream ; fi
@@ -114,13 +113,11 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
 
-# Fail loudly if the rust submodule was not initialized on the host before
-# `docker build`. The rust frontend source is brought in via the fetch_vllm
-# stage, so an uninitialized submodule would otherwise produce a confusing
-# cargo failure.
+# Fail loudly if the vendored rust frontend source is missing. The rust
+# frontend source is brought in via the fetch_vllm stage, so a missing source
+# tree would otherwise produce a confusing cargo failure.
 RUN if [ ! -f vllm/rust/Cargo.toml ]; then \
-        echo "ERROR: rust/ submodule is not initialized."; \
-        echo "Run 'git submodule update --init --recursive' on the host before building."; \
+        echo "ERROR: rust/ frontend source is missing."; \
         exit 1; \
     fi
 
@@ -297,13 +294,11 @@ FROM fetch_vllm AS build_vllm_wheel_release
 
 ARG COMMON_WORKDIR
 
-# Fail loudly if the rust submodule was not initialized on the host before
-# `docker build`. The rust frontend source is brought in via the fetch_vllm
-# stage, so an uninitialized submodule would otherwise produce a confusing
-# cargo failure.
+# Fail loudly if the vendored rust frontend source is missing. The rust
+# frontend source is brought in via the fetch_vllm stage, so a missing source
+# tree would otherwise produce a confusing cargo failure.
 RUN if [ ! -f vllm/rust/Cargo.toml ]; then \
-        echo "ERROR: rust/ submodule is not initialized."; \
-        echo "Run 'git submodule update --init --recursive' on the host before building."; \
+        echo "ERROR: rust/ frontend source is missing."; \
         exit 1; \
     fi
 

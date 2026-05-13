@@ -262,11 +262,10 @@ WORKDIR /workspace
 # Copy only the rust workspace — the binary is the sole artifact we need.
 COPY rust rust
 
-# Fail loudly if the rust submodule was not initialized on the host before
-# `docker build`. Without this check, cargo would emit a confusing error.
+# Fail loudly if the vendored rust frontend source is missing. Without this
+# check, cargo would emit a confusing error.
 RUN if [ ! -f rust/Cargo.toml ]; then \
-        echo "ERROR: rust/ submodule is not initialized."; \
-        echo "Run 'git submodule update --init --recursive' on the host before building."; \
+        echo "ERROR: rust/ frontend source is missing."; \
         exit 1; \
     fi
 
