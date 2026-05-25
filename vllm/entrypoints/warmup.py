@@ -119,17 +119,19 @@ async def warmup_engine(
             concurrency,
             len(config.prompts),
         )
+        sem = asyncio.Semaphore(concurrency)
         await asyncio.gather(
             *(
                 _warmup_one(
                     engine_client,
-                    config.prompts[i % len(config.prompts)],
+                    p,
                     config.request_params,
                     is_embed,
+                    sem,
                     concurrency,
                     i,
                 )
-                for i in range(concurrency)
+                for i, p in enumerate(config.prompts)
             )
         )
 
@@ -141,31 +143,35 @@ async def _warmup_one(
     prompt_config: WarmupPrompt,
     request_params: dict[str, Any],
     is_embed: bool,
+    sem: asyncio.Semaphore,
     concurrency: int,
     idx: int,
 ) -> None:
-    if is_embed:
-        request_id = f"warmup_embed_{id(prompt_config)}_{concurrency}_{idx}"
-        prompt = prompt_config.prompt or prompt_config.input or ""
-        pooling_params = PoolingParams(**request_params)
-        stream = engine_client.encode(
-            prompt=prompt, pooling_params=pooling_params, request_id=request_id
-        )
-    else:
-        request_id = f"warmup_{id(prompt_config)}_{concurrency}_{idx}"
-        if prompt_config.prompt is not None:
-            prompt = prompt_config.prompt
-        elif prompt_config.messages is not None:
-            prompt = await _render_messages(engine_client, prompt_config.messages)
+    async with sem:
+        if is_embed:
+            request_id = f"warmup_embed_{id(prompt_config)}_{concurrency}_{idx}"
+            prompt = prompt_config.prompt or prompt_config.input or ""
+            pooling_params = PoolingParams(**request_params)
+            stream = engine_client.encode(
+                prompt=prompt, pooling_params=pooling_params, request_id=request_id
+            )
         else:
-            prompt = ""
-        params = SamplingParams(max_tokens=prompt_config.max_tokens, **request_params)
-        stream = engine_client.generate(
-            prompt=prompt, sampling_params=params, request_id=request_id
-        )
+            request_id = f"warmup_{id(prompt_config)}_{concurrency}_{idx}"
+            if prompt_config.prompt is not None:
+                prompt = prompt_config.prompt
+            elif prompt_config.messages is not None:
+                prompt = await _render_messages(engine_client, prompt_config.messages)
+            else:
+                prompt = ""
+            params = SamplingParams(
+                max_tokens=prompt_config.max_tokens, **request_params
+            )
+            stream = engine_client.generate(
+                prompt=prompt, sampling_params=params, request_id=request_id
+            )
 
-    async for _ in stream:
-        pass
+        async for _ in stream:
+            pass
 
 
 async def _render_messages(
