@@ -12,6 +12,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh
 - label: Distributed FlashInfer NixlConnector PD accuracy (4 GPUs)
   key: distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus
@@ -23,6 +27,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - FLASHINFER=1 bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh
 
 - label: DP EP Distributed NixlConnector PD accuracy tests (4 GPUs)
@@ -35,6 +43,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - DP_EP=1 bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh
 
 - label: CrossLayer KV layout Distributed NixlConnector PD accuracy tests (4 GPUs)
@@ -47,6 +59,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - CROSS_LAYERS_BLOCKS=True bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh
 
 - label: Hybrid SSM NixlConnector PD accuracy tests (4 GPUs)
@@ -59,6 +75,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - HYBRID_SSM=1 bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh
 
 - label: MultiConnector (Nixl+Offloading) PD accuracy (2 GPUs)
@@ -74,6 +94,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - bash v1/kv_connector/nixl_integration/run_multi_connector_accuracy_test.sh
 
 - label: NixlConnector PD + Spec Decode acceptance (2 GPUs)
@@ -88,6 +112,10 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - bash v1/kv_connector/nixl_integration/config_sweep_spec_decode_test.sh
 
 - label: MultiConnector (Nixl+Offloading) PD edge cases (2 GPUs)
@@ -103,4 +131,8 @@ steps:
     - tests/v1/kv_connector/nixl_integration/
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - bash v1/kv_connector/nixl_integration/run_multi_connector_edge_case_test.sh

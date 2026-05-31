@@ -87,6 +87,10 @@ steps:
     - tests/entrypoints/openai/correctness/test_lmeval.py
   commands:
     - uv pip install --system -r /vllm-workspace/requirements/kv_connectors.txt
+    # The default `nixl` wheel is the CUDA 12 build; force-reinstall the wheel
+    # matching this image's CUDA major so the correct nixl_ep_cpp.so is installed
+    # (mirrors the repair in docker/Dockerfile).
+    - CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])") && uv pip install --system --force-reinstall --no-deps "nixl-cu${CUDA_MAJOR}"
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     # split the test to avoid interference
     - pytest -v -s -m 'not cpu_test' v1/core
