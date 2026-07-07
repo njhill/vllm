@@ -230,7 +230,10 @@ def warmup_kernels(
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
         sampling_params = None
-        pooling_params = PoolingParams()
+        supported_tasks = model_runner.get_supported_tasks()
+        task = supported_tasks[0] if supported_tasks else None
+        pooling_params = PoolingParams(task=task)
+        pooling_params.verify(model_runner.model_config)
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None

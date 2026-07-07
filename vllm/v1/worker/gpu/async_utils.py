@@ -6,7 +6,12 @@ import numpy as np
 import torch
 
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
-from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    LogprobsTensors,
+    ModelRunnerOutput,
+    PoolerOutput,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
@@ -85,39 +90,74 @@ class AsyncOutput(AsyncModelRunnerOutput):
         return self.model_runner_output
 
 
+def _copy_pooler_output_to_cpu(
+    raw_pooler_output: PoolerOutput, finished_mask: list[bool]
+) -> list[torch.Tensor | None]:
+    """Move finished requests' pooled outputs to CPU (non-blocking).
+
+    Handles both a stacked ``[num_reqs, ...]`` tensor (seq-level poolers) and a
+    ragged ``list[Tensor | None]`` (token-level poolers). Unfinished
+    chunked-prefill requests map to ``None``. Caller must synchronize the copy
+    stream before reading the returned tensors.
+    """
+    num_reqs = len(finished_mask)
+    if isinstance(raw_pooler_output, torch.Tensor):
+        if raw_pooler_output.shape[0] != num_reqs:
+            raise ValueError(
+                "pooler output batch size does not match num_reqs: "
+                f"{raw_pooler_output.shape[0]} != {num_reqs}."
+            )
+        if all(finished_mask):
+            return list(raw_pooler_output.to("cpu", non_blocking=True).unbind(dim=0))
+
+        finished_indices = [i for i, finished in enumerate(finished_mask) if finished]
+        index_tensor = torch.tensor(
+            finished_indices, device=raw_pooler_output.device, dtype=torch.long
+        )
+        finished_outputs = raw_pooler_output.index_select(0, index_tensor).to(
+            "cpu", non_blocking=True
+        )
+        output: list[torch.Tensor | None] = [None] * num_reqs
+        for i, out in zip(finished_indices, finished_outputs):
+            output[i] = out
+        return output
+
+    if len(raw_pooler_output) != num_reqs:
+        raise ValueError(
+            "pooler output length does not match num_reqs: "
+            f"{len(raw_pooler_output)} != {num_reqs}."
+        )
+    output = [None] * num_reqs
+    for i, (out, finished) in enumerate(zip(raw_pooler_output, finished_mask)):
+        if finished and out is not None:
+            output[i] = out.to("cpu", non_blocking=True)
+    return output
+
+
 class AsyncPoolingOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,
-        pooler_output: torch.Tensor,
-        is_valid: torch.Tensor | None,
+        pooler_output: PoolerOutput,
+        finished_mask: list[bool],
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
     ):
         self.model_runner_output = model_runner_output
+        # Retain a reference to the GPU output until the copy completes.
         self.pooler_output = pooler_output
-        self.is_valid = is_valid
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
-            self.pooler_output_cpu = self.pooler_output.to("cpu", non_blocking=True)
-            if self.is_valid is not None:
-                self.is_valid_cpu = self.is_valid.to("cpu", non_blocking=True)
-            else:
-                self.is_valid_cpu = None
+            self.model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
+                pooler_output, finished_mask
+            )
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         self.copy_event.synchronize()
-        if self.is_valid_cpu is not None:
-            is_valid_cpu = self.is_valid_cpu.tolist()
-            for i, is_valid in enumerate(is_valid_cpu):
-                if not is_valid:
-                    pooler_output[i] = None
-        self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
 
 

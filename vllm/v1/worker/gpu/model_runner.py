@@ -366,7 +366,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
-            self.pooling_runner = PoolingRunner(self.model)
+            self.pooling_runner = PoolingRunner(
+                self.model, self.max_num_reqs, self.vllm_config, self.device
+            )
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model,
             self.model_config,
@@ -787,6 +789,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.pooling_runner is not None:
+            self.pooling_runner.remove_request(req_idx, req_id)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -858,11 +862,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_id, req_index, new_req_data.sampling_params
                 )
 
+            elif new_req_data.pooling_params is not None:
+                assert self.pooling_runner is not None
+                self.pooling_runner.add_request(
+                    req_index, req_id, new_req_data.pooling_params
+                )
+
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
+        if self.pooling_runner is not None:
+            self.pooling_runner.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -1587,26 +1599,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         assert self.pooling_runner is not None
-        pooler_output, is_valid = self.pooling_runner.pool(
+        raw_pooler_output, finished_mask = self.pooling_runner.pool(
             hidden_states, input_batch, self.req_states
         )
 
         # Build the model runner output.
+        model_runner_output: AsyncPoolingOutput | ModelRunnerOutput
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
         )
-        async_output = AsyncPoolingOutput(
-            model_runner_output=model_runner_output,
-            pooler_output=pooler_output,
-            is_valid=is_valid,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-        )
+        if raw_pooler_output is None or not any(finished_mask):
+            # Nothing finished this step (e.g. chunked prefill still in progress).
+            model_runner_output.pooler_output = [None] * input_batch.num_reqs
+        else:
+            # Start the async D2H copy on the copy stream before enqueuing the
+            # num_computed_tokens update, so the copy overlaps that kernel.
+            model_runner_output = AsyncPoolingOutput(
+                model_runner_output=model_runner_output,
+                pooler_output=raw_pooler_output,
+                finished_mask=finished_mask,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+            )
 
         self.postprocess_num_computed_tokens(input_batch)
-        return async_output
+        return model_runner_output
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         # Update the number of computed tokens.
