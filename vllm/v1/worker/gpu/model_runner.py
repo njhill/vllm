@@ -790,7 +790,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if req_idx is None:
             return False
         if self.pooling_runner is not None:
-            self.pooling_runner.remove_request(req_idx, req_id)
+            self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -865,7 +865,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elif new_req_data.pooling_params is not None:
                 assert self.pooling_runner is not None
                 self.pooling_runner.add_request(
-                    req_index, req_id, new_req_data.pooling_params
+                    req_index,
+                    new_req_data.pooling_params,
+                    new_req_data.prompt_token_ids,
                 )
 
         if scheduler_output.scheduled_new_reqs:
@@ -1250,6 +1252,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            if self.pooling_runner is not None:
+                # Cross-encoder token-type bits, written in-band into the
+                # input_ids buffer (decoded by BERT-family embeddings).
+                self.pooling_runner.encode_token_type_ids(input_batch)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

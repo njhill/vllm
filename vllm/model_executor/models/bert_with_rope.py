@@ -40,7 +40,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from .bert import BertPooler
+from .bert import BertPooler, _decode_token_type_ids
 from .interfaces import SupportsCrossEncoding, SupportsQuant
 from .interfaces_base import default_pooling_type
 
@@ -70,16 +70,15 @@ class BertWithRopeEmbedding(nn.Module):
         input_ids: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        input_shape = input_ids.size()
+        if self.token_type_embeddings is not None and token_type_ids is None:
+            # Token-type ids may be encoded in-band in the high bits of
+            # input_ids (see bert.py); this also strips those bits.
+            token_type_ids = _decode_token_type_ids(input_ids)
+
         inputs_embeds = self.word_embeddings(input_ids)
 
         embeddings = inputs_embeds
         if self.token_type_embeddings is not None:
-            if token_type_ids is None:
-                token_type_ids = torch.zeros(
-                    input_shape, dtype=torch.long, device=inputs_embeds.device
-                )
-
             token_type_embeddings = self.token_type_embeddings(token_type_ids)
             embeddings += token_type_embeddings
 

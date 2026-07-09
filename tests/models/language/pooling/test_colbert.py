@@ -15,6 +15,16 @@ from tests.utils import wait_for_rocm_memory_to_settle
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.entrypoints.pooling.scoring.utils import compute_maxsim_score
 
+
+@pytest.fixture(autouse=True)
+def use_spawn(monkeypatch):
+    # This module creates ~30 engines sequentially in one pytest process;
+    # engine teardown leaves daemon threads behind, and forking the engine
+    # process from an increasingly multi-threaded parent eventually deadlocks
+    # the child on an inherited lock (deterministically by mid-module).
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
 # -----------------------------------------------------------------------
 # Model definitions: (model_name, colbert_dim, extra vllm_runner kwargs)
 # -----------------------------------------------------------------------
