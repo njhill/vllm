@@ -17,12 +17,14 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorMetadata,
     SupportsHMA,
     supports_hma,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
+    MultiKVConnectorMetadata,
     MultiKVConnectorStats,
     MultiKVConnectorWorkerMetadata,
 )
@@ -409,6 +411,23 @@ def get_connector_events() -> dict[str, list[str]]:
             print(f"[ERROR] Could not read connector events for {name}: {e}")
 
     return connector_events
+
+
+def test_rebind_does_not_reapply_extra_async_saves(mc):
+    """The same metadata may be rebound after a deferred KV load
+    (KVConnectorLoadGate); the extra async-save counts must not be
+    re-applied on top of state get_finished has already decremented."""
+    metadata = MultiKVConnectorMetadata(
+        metadata=(KVConnectorMetadata(), KVConnectorMetadata()),
+        extra_async_saves={"req-1": 2},
+    )
+    mc.bind_connector_metadata(metadata)
+    assert mc._extra_async_saves == {"req-1": 2}
+
+    # A save completes between the binds.
+    mc._extra_async_saves["req-1"] = 1
+    mc.bind_connector_metadata(metadata)
+    assert mc._extra_async_saves == {"req-1": 1}
 
 
 def test_engine_id_conflict():

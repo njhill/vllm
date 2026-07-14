@@ -227,6 +227,10 @@ class KVConnectorBase_V1(ABC):
         before the model execution. The metadata will be used for runtime
         KV cache loading and saving.
 
+        May be called more than once with the same metadata when a step's
+        loads are deferred behind KV block zeroing (see
+        ``KVConnectorLoadGate``); implementations must tolerate rebinding.
+
         Args:
             connector_metadata (dict): the connector metadata.
         """
@@ -306,7 +310,8 @@ class KVConnectorBase_V1(ABC):
         """
         Start loading the KV cache from the connector to vLLM's paged
         KV buffer. This is called from the forward context before the
-        forward pass to enable async loading during model execution.
+        forward pass, or after the forward launch on steps without
+        synchronous loads.
 
         Args:
             forward_context (ForwardContext): the forward context.

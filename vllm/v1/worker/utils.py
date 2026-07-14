@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import math
-from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import product as iprod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
@@ -37,6 +39,13 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.block_table import get_block_table_width
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorBase_V1,
+        KVConnectorMetadata,
+    )
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -106,6 +115,7 @@ class KVBlockZeroer:
         cache_dtype: str,
         static_forward_context: dict[str, Any],
         runner_only_attn_layers: set[str] | None = None,
+        has_external_block_writers: bool = False,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -118,8 +128,14 @@ class KVBlockZeroer:
         ``block_id * page_size_el`` lands at the correct offset.
 
         Only AttentionSpec layers are processed; Mamba layers are skipped.
+
+        has_external_block_writers: freshly allocated blocks may be written
+        from outside the compute stream (consumer KV connector);
+        ``zero_block_ids`` then zeroes on a dedicated stream and returns a
+        completion event.
         """
         self.device = device
+        self.has_external_block_writers = has_external_block_writers
         self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
 
         if runner_only_attn_layers is None:
@@ -188,29 +204,136 @@ class KVBlockZeroer:
             blk_size,
             len(seg_addrs),
         )
+        # Cached; current_stream() is expensive on the per-step path.
+        self._main_stream = torch.cuda.current_stream(self.device)
+        # Zeroing runs on its own stream so that waiting for it does not
+        # wait for compute-stream backlog (see zero_block_ids).
+        self._zero_stream: torch.cuda.Stream | None = None
+        if self.has_external_block_writers:
+            self._zero_stream = torch.cuda.Stream(device=self.device)
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+    @contextlib.contextmanager
+    def zero_stream(self) -> Iterator[torch.cuda.Event | None]:
+        if self._zero_stream is None:
+            yield None
             return
+
+        event = torch.cuda.Event()
+        torch.cuda.set_stream(self._zero_stream)
+        try:
+            yield event
+        finally:
+            torch.cuda.set_stream(self._main_stream)
+
+        event.record(self._zero_stream)
+        self._main_stream.wait_event(event)
+
+    def zero_block_ids(self, block_ids: list[int]) -> torch.cuda.Event | None:
+        """Zero the KV cache memory for the given block IDs.
+
+        With ``has_external_block_writers``, the zeroing runs on a dedicated
+        stream and its completion event is returned; out-of-stream writers
+        must wait for it (see ``KVConnectorLoadGate`` for why and how). The
+        main stream waits on the event device-side, so same-step compute
+        stays ordered after the zeroing. Otherwise the zeroing runs on the
+        current stream and None is returned.
+        """
+        if not block_ids or self._meta is None:
+            return None
         seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks * n_segs * max_chunks,)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_page_sizes,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            MAX_CHUNKS=max_chunks,
-            BLOCK_SIZE=blk_size,
-        )
+
+        with self.zero_stream() as event:
+            # No wait on the main stream needed: defer_block_free ensures
+            # blocks an in-flight step may still access aren't reallocated.
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_page_sizes,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                MAX_CHUNKS=max_chunks,
+                BLOCK_SIZE=blk_size,
+            )
+            return event
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
         if num_kv_blocks > 0:
             self.zero_block_ids([0])
+
+
+class KVConnectorLoadGate:
+    """Starts KV connector loads ordered after in-flight KV block zeroing.
+
+    A consumer connector writes pulled KV into freshly allocated blocks from
+    outside the compute stream (e.g. a NIXL RDMA READ), so loads must not
+    start while those blocks' zeroing is in flight or it could wipe the
+    pulled data. Rather than blocking the host, a step whose zeroing event
+    hasn't fired has its loads deferred to a later step — safe for async
+    loads, whose requests stay in WAITING_FOR_REMOTE_KVS until the worker
+    reports them finished, keeping the target blocks allocated. Sync loads
+    (consumed by their own forward) instead wait — only for the zeroing
+    kernel on its otherwise-idle stream, not for compute backlog.
+    """
+
+    def __init__(self) -> None:
+        self._zeroing_event: torch.cuda.Event | None = None
+        self._deferred: deque[tuple[KVConnectorMetadata, torch.cuda.Event | None]] = (
+            deque()
+        )
+
+    def set_zeroing_event(self, event: torch.cuda.Event | None) -> None:
+        """Record this step's zeroing event, consumed by start_loads."""
+        self._zeroing_event = event
+
+    def start_loads(
+        self,
+        kv_connector: "KVConnectorBase_V1",
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Start this step's KV loads; the caller must have already bound
+        this step's connector metadata.
+
+        Loads start strictly in step order, deferring at the first step
+        whose zeroing is still in flight. Requires a forward context;
+        returns with this step's metadata bound, loads started or not.
+        """
+        event, self._zeroing_event = self._zeroing_event, None
+        if not self._deferred and (event is None or event.query()):
+            # No zeroing in flight and nothing deferred.
+            kv_connector.start_load_kv(get_forward_context())
+            return
+
+        metadata = scheduler_output.kv_connector_metadata
+        assert metadata is not None
+        self._deferred.append((metadata, event))
+
+        if scheduler_output.has_sync_kv_loads:
+            # Sync loads can't be deferred; the newest event completing
+            # implies all earlier zeroing completed (FIFO stream).
+            for _, ev in reversed(self._deferred):
+                if ev is not None:
+                    ev.synchronize()
+                    break
+
+        bound = metadata
+        while self._deferred:
+            head_metadata, ev = self._deferred[0]
+            if ev is not None and not ev.query():
+                break
+            self._deferred.popleft()
+            if head_metadata is not bound:
+                kv_connector.bind_connector_metadata(head_metadata)
+                bound = head_metadata
+            kv_connector.start_load_kv(get_forward_context())
+
+        if bound is not metadata:
+            # Replayed loads rebound their own metadata; the rest of the
+            # step (e.g. KV saves) needs this step's bound again.
+            kv_connector.bind_connector_metadata(metadata)
 
 
 @dataclass

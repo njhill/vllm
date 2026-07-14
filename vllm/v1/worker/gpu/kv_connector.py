@@ -12,7 +12,6 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import (
-    get_forward_context,
     is_forward_context_available,
     set_forward_context,
 )
@@ -21,6 +20,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.worker.utils import KVConnectorLoadGate
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
+
+    def set_block_zeroing_event(self, event: torch.cuda.Event | None) -> None:
+        pass
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
@@ -56,7 +59,24 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.register_kv_caches(kv_caches_dict)
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        self._load_gate = KVConnectorLoadGate()
+        # Step whose loads start in post_forward (no sync loads).
+        self._pending_load_start: SchedulerOutput | None = None
         self._disabled = False
+
+    def set_block_zeroing_event(self, event: torch.cuda.Event | None) -> None:
+        # A consumer connector's loads must not overlap the zeroing.
+        if not self._disabled:
+            self._load_gate.set_zeroing_event(event)
+
+    def _start_loads(self, scheduler_output: "SchedulerOutput") -> None:
+        self._pending_load_start = None
+        # TODO: sort out KV Connectors' use of forward_context
+        if is_forward_context_available():
+            self._load_gate.start_loads(self.kv_connector, scheduler_output)
+        else:
+            with set_forward_context(None, self.vllm_config):
+                self._load_gate.start_loads(self.kv_connector, scheduler_output)
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:
@@ -67,18 +87,22 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
-        # TODO: sort out KV Connectors' use of forward_context
-        if is_forward_context_available():
-            self.kv_connector.start_load_kv(get_forward_context())
+        if scheduler_output.has_sync_kv_loads:
+            self._start_loads(scheduler_output)
         else:
-            with set_forward_context(None, self.vllm_config):
-                self.kv_connector.start_load_kv(get_forward_context())
+            # No sync loads feeding this step's forward: start the (async)
+            # loads in post_forward instead, keeping their host-side
+            # submission cost off the critical path.
+            self._pending_load_start = scheduler_output
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
         if self._disabled:
             return None
+
+        if self._pending_load_start is not None:
+            self._start_loads(self._pending_load_start)
 
         output = KVConnectorOutput()
         if wait_for_save:

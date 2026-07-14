@@ -255,6 +255,14 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Whether any scheduled request consumes KV that the connector loads
+    # synchronously during this step (load_async=False). Such loads can't be
+    # deferred past pending block zeroing (see KVConnectorLoadGate), and
+    # start_load_kv is invoked before the forward; on steps without sync
+    # loads it is invoked after the forward launch instead, keeping async
+    # load submission off the critical path.
+    has_sync_kv_loads: bool = False
+
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 

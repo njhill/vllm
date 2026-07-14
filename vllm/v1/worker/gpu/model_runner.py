@@ -542,12 +542,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+        kv_transfer_config = self.vllm_config.kv_transfer_config
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
+            has_external_block_writers=(
+                kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
+            ),
         )
 
     @torch.inference_mode()
@@ -916,9 +920,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        new_block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+        if new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            zeroing_event = self.kv_block_zeroer.zero_block_ids(new_block_ids_to_zero)
+            self.kv_connector.set_block_zeroing_event(zeroing_event)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.

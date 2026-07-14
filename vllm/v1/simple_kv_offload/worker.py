@@ -187,65 +187,67 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
-        if metadata.load_event >= 0:
+        # The same metadata may be rebound after a deferred load; guard on
+        # the high-water marks so already-completed events aren't re-added.
+        if metadata.load_event > self._load_hwm:
             self._pending_load_event_indices.add(metadata.load_event)
-        if metadata.store_event >= 0:
+        if metadata.store_event > self._store_hwm:
             self._pending_store_event_indices.add(metadata.store_event)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
 
     def start_load_kv(self) -> None:
-        # NOTE: we defer launching both load and store to get_finished(),
-        # which runs after model execution. This hides the CPU-side
-        # block copy op overhead (~5ms) behind GPU compute.
-        pass
+        # Invoked after the forward launch (no sync loads), so
+        # the CPU-side copy op overhead (~5ms) stays hidden behind GPU
+        # compute, while KVConnectorLoadGate orders the loads after any
+        # in-flight KV block zeroing. Stores are issued in wait_for_save().
+        metadata = self._connector_metadata
+        if metadata is not None and metadata.load_cpu_blocks:
+            self._backend.launch_copy(
+                metadata.load_cpu_blocks,
+                metadata.load_gpu_blocks,
+                is_store=False,
+                event_idx=metadata.load_event,
+                events_list=self._load_events,
+            )
 
     def wait_for_save(self) -> None:
-        pass
+        """Submit async stores.
+
+        Stores (GPU->CPU) read the live KV cache, which the compute stream may
+        still be writing under v1 overlapped execution, so they are ordered
+        after a compute-done event recorded on the current stream. See
+        #45704 for the bug and #39306 for the srcAccessOrder rationale.
+        """
+        metadata = self._connector_metadata
+        if metadata is not None and metadata.store_gpu_blocks:
+            if self._store_compute_done is None:
+                self._store_compute_done = torch.Event()
+            self._store_compute_done.record(torch.cuda.current_stream())
+            self._backend.launch_copy(
+                metadata.store_gpu_blocks,
+                metadata.store_cpu_blocks,
+                is_store=True,
+                event_idx=metadata.store_event,
+                events_list=self._store_events,
+                wait_event=self._store_compute_done,
+            )
 
     def get_finished(
         self,
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Submit transfers and report completed events to the scheduler.
+        """Report completed transfer events to the scheduler.
 
-        Stores (GPU->CPU) read the live KV cache, which the compute stream may
-        still be writing under v1 overlapped execution, so they are ordered
-        after a compute-done event recorded on the current stream. Loads
-        (CPU->GPU) read stable pinned host memory and launch immediately. See
-        #45704 for the bug and #39306 for the srcAccessOrder rationale.
+        Loads are submitted in start_load_kv() and stores in wait_for_save().
 
         Returns:
             tuple of (finished_sending, finished_recving).
             - finished_sending: always None (stores use worker metadata).
             - finished_recving: req_ids whose loads have completed.
         """
-        # (1) Submit transfers
         metadata = self._connector_metadata
-        if metadata is not None:
-            if metadata.load_cpu_blocks:
-                self._backend.launch_copy(
-                    metadata.load_cpu_blocks,
-                    metadata.load_gpu_blocks,
-                    is_store=False,
-                    event_idx=metadata.load_event,
-                    events_list=self._load_events,
-                )
-            if metadata.store_gpu_blocks:
-                if self._store_compute_done is None:
-                    self._store_compute_done = torch.Event()
-                self._store_compute_done.record(torch.cuda.current_stream())
-                self._backend.launch_copy(
-                    metadata.store_gpu_blocks,
-                    metadata.store_cpu_blocks,
-                    is_store=True,
-                    event_idx=metadata.store_event,
-                    events_list=self._store_events,
-                    wait_event=self._store_compute_done,
-                )
-
-        # (2) Track completed transfer events
         finished_recving: set[str] = set()
 
         if self._pending_load_event_indices:

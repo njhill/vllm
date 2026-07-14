@@ -1142,6 +1142,7 @@ class GPUModelRunner(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        kv_transfer_config = self.vllm_config.kv_transfer_config
         self._kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
@@ -1149,12 +1150,17 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
+            has_external_block_writers=(
+                kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
+            ),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+            zeroing_event = self._kv_block_zeroer.zero_block_ids(block_ids)
+            # A consumer connector's loads must not overlap the zeroing.
+            self.kv_load_gate.set_zeroing_event(zeroing_event)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:

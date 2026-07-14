@@ -14,7 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
-from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -22,7 +22,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, KVConnectorLoadGate
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -32,14 +32,21 @@ logger = init_logger(__name__)
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
-    @staticmethod
+    _kv_load_gate: KVConnectorLoadGate | None = None
+
+    @property
+    def kv_load_gate(self) -> KVConnectorLoadGate:
+        if self._kv_load_gate is None:
+            self._kv_load_gate = KVConnectorLoadGate()
+        return self._kv_load_gate
+
     def kv_connector_no_forward(
-        scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
+        self, scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
     ) -> ModelRunnerOutput:
         # KV send/recv even if no work to do.
         with (
             set_forward_context(None, vllm_config),
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
+            self._get_kv_connector_output(
                 scheduler_output, wait_for_save=False
             ) as kv_connector_output,
         ):
@@ -47,13 +54,13 @@ class KVConnectorModelRunnerMixin:
 
         return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
-    @staticmethod
     def maybe_get_kv_connector_output(
+        self,
         scheduler_output: "SchedulerOutput",
         defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
         return (
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
+            self._get_kv_connector_output(
                 scheduler_output, defer_finalize=defer_finalize
             )
             if has_kv_transfer_group()
@@ -73,29 +80,32 @@ class KVConnectorModelRunnerMixin:
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
-    @staticmethod
     @contextmanager
     def _get_kv_connector_output(
+        self,
         scheduler_output: "SchedulerOutput",
         wait_for_save: bool = True,
         defer_finalize: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
 
-        # Update KVConnector with the KVConnector metadata forward().
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
-        # Background KV cache transfers happen here.
-        # These transfers are designed to be async and the requests
-        # involved may be disjoint from the running requests.
-        # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        # Start this step's KV loads, ordered after any in-flight KV block
+        # zeroing. Sync loads feed this step's forward so must precede it;
+        # otherwise start (async) loads after the forward launch, keeping
+        # their host-side submission cost off the critical path.
+        start_after_forward = not scheduler_output.has_sync_kv_loads
+        if not start_after_forward:
+            self.kv_load_gate.start_loads(kv_connector, scheduler_output)
         try:
             yield output
         finally:
+            if start_after_forward:
+                self.kv_load_gate.start_loads(kv_connector, scheduler_output)
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
 
