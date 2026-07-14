@@ -160,6 +160,32 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+
+        # Self-calibrate the prefill latency-budget coefficients for THIS
+        # deployment (model/quant/GPU/TP-PP-DP-EP) by timing a few synthetic
+        # forwards now that the model + KV cache + cudagraphs are ready.
+        sched_config = vllm_config.scheduler_config
+        if (
+            sched_config.prefill_latency_autocal
+            and sched_config.prefill_latency_budget_ms > 0
+            and hasattr(self.scheduler, "set_latency_coeffs")
+        ):
+            from vllm.v1.core.sched.lat_calib import calibrate
+
+            coeffs = calibrate(
+                self.model_executor,
+                kv_cache_config,
+                vllm_config.model_config.max_model_len,
+                sched_config.max_num_batched_tokens,
+            )
+            if coeffs is not None:
+                self.scheduler.set_latency_coeffs(
+                    coeffs["M_floor"],
+                    coeffs["b"],
+                    coeffs["s"],
+                    coeffs["k1"],
+                    coeffs["k2"],
+                )
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 

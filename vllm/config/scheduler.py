@@ -166,6 +166,46 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    prefill_latency_budget_ms: float = Field(default=0.0, ge=0.0)
+    """Target per-step prefill forward latency (ms). When > 0, the scheduler
+    admits prefill chunks into a step until the predicted forward time
+    ``T = b + s*N + k1*sum(P) + k2*sum(C*P + C^2/2)`` reaches this budget,
+    instead of packing purely to ``max_num_batched_tokens``. Deep-context chunks
+    (large prefix ``P``) cost more and are chunked smaller, keeping per-step work
+    uniform so the pipeline-parallel schedule stays full. 0.0 (the default)
+    disables the feature. ``max_num_batched_tokens`` remains a hard buffer
+    ceiling, so raise it if the budget's fresh-batch cap exceeds it."""
+
+    prefill_latency_autocal: bool = False
+    """If True and ``prefill_latency_budget_ms > 0``, self-calibrate the latency
+    coefficients (b/s/k1/k2) at engine startup by timing a few synthetic
+    forwards for the running deployment (model, quant, GPU, TP/PP/DP/EP layout).
+    Takes a few tens of seconds. When False, the coefficients below are used."""
+
+    prefill_latency_b_ms: float = Field(default=41.0, ge=0.0)
+    """Latency-model fixed per-step overhead ``b`` (ms). Only used when
+    ``prefill_latency_budget_ms > 0`` and auto-calibration is off."""
+
+    prefill_latency_s_ms_per_tok: float = Field(default=0.012, ge=0.0)
+    """Latency-model per-token slope ``s`` (ms/token; MLP compute). Only used
+    when ``prefill_latency_budget_ms > 0`` and auto-calibration is off."""
+
+    prefill_latency_k1_ms_per_ctx_tok: float = Field(default=0.0, ge=0.0)
+    """Latency-model KV-read coefficient ``k1`` (ms per context token). This
+    cost is charged once per chunk independent of chunk size. Only used when
+    ``prefill_latency_budget_ms > 0`` and auto-calibration is off."""
+
+    prefill_latency_k2_ms_per_pair: float = Field(default=6.5e-7, ge=0.0)
+    """Latency-model attention-compute coefficient ``k2`` (ms per query/key
+    pair). Only used when ``prefill_latency_budget_ms > 0`` and
+    auto-calibration is off."""
+
+    prefill_latency_chunk_round: int = Field(default=0, ge=0)
+    """Round latency-budget prefill chunk sizes down to a multiple of this many
+    tokens to keep the attention kernel page-aligned. 0 (the default) uses
+    ``max(kv_cache_block_size, 64)``. Only used when
+    ``prefill_latency_budget_ms > 0``."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

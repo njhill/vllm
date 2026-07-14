@@ -614,6 +614,18 @@ class EngineArgs:
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
 
+    prefill_latency_budget_ms: float = SchedulerConfig.prefill_latency_budget_ms
+    prefill_latency_autocal: bool = SchedulerConfig.prefill_latency_autocal
+    prefill_latency_b_ms: float = SchedulerConfig.prefill_latency_b_ms
+    prefill_latency_s_ms_per_tok: float = SchedulerConfig.prefill_latency_s_ms_per_tok
+    prefill_latency_k1_ms_per_ctx_tok: float = (
+        SchedulerConfig.prefill_latency_k1_ms_per_ctx_tok
+    )
+    prefill_latency_k2_ms_per_pair: float = (
+        SchedulerConfig.prefill_latency_k2_ms_per_pair
+    )
+    prefill_latency_chunk_round: int = SchedulerConfig.prefill_latency_chunk_round
+
     watermark: float = SchedulerConfig.watermark
 
     disable_hybrid_kv_cache_manager: bool | None = (
@@ -1473,6 +1485,33 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--prefill-latency-budget-ms",
+            **scheduler_kwargs["prefill_latency_budget_ms"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-autocal",
+            **scheduler_kwargs["prefill_latency_autocal"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-b-ms", **scheduler_kwargs["prefill_latency_b_ms"]
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-s-ms-per-tok",
+            **scheduler_kwargs["prefill_latency_s_ms_per_tok"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-k1-ms-per-ctx-tok",
+            **scheduler_kwargs["prefill_latency_k1_ms_per_ctx_tok"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-k2-ms-per-pair",
+            **scheduler_kwargs["prefill_latency_k2_ms_per_pair"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-latency-chunk-round",
+            **scheduler_kwargs["prefill_latency_chunk_round"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2182,6 +2221,13 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            prefill_latency_budget_ms=self.prefill_latency_budget_ms,
+            prefill_latency_autocal=self.prefill_latency_autocal,
+            prefill_latency_b_ms=self.prefill_latency_b_ms,
+            prefill_latency_s_ms_per_tok=self.prefill_latency_s_ms_per_tok,
+            prefill_latency_k1_ms_per_ctx_tok=self.prefill_latency_k1_ms_per_ctx_tok,
+            prefill_latency_k2_ms_per_pair=self.prefill_latency_k2_ms_per_pair,
+            prefill_latency_chunk_round=self.prefill_latency_chunk_round,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

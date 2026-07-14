@@ -113,6 +113,48 @@ class Scheduler(SchedulerInterface):
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+
+        # Per-step prefill attention budget (experimental, OFF by default).
+        # Admits prefill chunks into a step until the predicted step forward time
+        #   T = b + s*N + k1*ΣP + k2*Σ(C·P + C²/2)
+        # reaches the budget, keeping the PP pipeline full by making per-step work
+        # uniform across mixed prefix depths. A step holding a single request has
+        # its chunk capped so its predicted cost equals the budget (dynamic
+        # chunk-size reduction); a step with several requests packs them until the
+        # cumulative cost hits the budget. Coefficients come from SchedulerConfig
+        # (offline fit) or startup auto-calibration.
+        sc = self.scheduler_config
+        self.latency_budget_ms = sc.prefill_latency_budget_ms
+        self._lat_b = sc.prefill_latency_b_ms
+        self._lat_s = sc.prefill_latency_s_ms_per_tok
+        self._lat_k1 = sc.prefill_latency_k1_ms_per_ctx_tok
+        self._lat_k2 = sc.prefill_latency_k2_ms_per_pair
+        # Predicted-latency floor from auto-calibration (recorded for logging;
+        # the accumulator-based cap does not apply the floor directly).
+        self._lat_floor = 0.0
+        # Round chunk sizes down to a multiple of max(page_size, 64) to keep the
+        # attention kernel page-aligned.
+        try:
+            _page = vllm_config.cache_config.block_size or 0
+        except Exception:
+            _page = 0
+        self._chunk_round = sc.prefill_latency_chunk_round or max(_page, 64)
+        self._step_lat = 0.0  # per-step accumulator (reset each schedule())
+        if self.latency_budget_ms > 0:
+            logger.info(
+                "Per-step prefill attention budget ON: budget=%.1fms round=%d "
+                "coeffs(b=%.1f,s=%.4g,k1=%.3g,k2=%.3g). max_num_scheduled_tokens"
+                "=%d is a hard buffer ceiling -- raise --max-num-batched-tokens "
+                "if it clips the budget.",
+                self.latency_budget_ms,
+                self._chunk_round,
+                self._lat_b,
+                self._lat_s,
+                self._lat_k1,
+                self._lat_k2,
+                self.max_num_scheduled_tokens,
+            )
+
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -414,6 +456,83 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def set_latency_coeffs(
+        self, M_floor: float, b: float, s: float, k1: float, k2: float
+    ) -> None:
+        """Install auto-calibrated latency coefficients (overrides the config
+        defaults). Two-term attention: k1=KV-read per context token, k2=compute
+        per query/key pair. M_floor is recorded for logging only."""
+        self._lat_floor = M_floor
+        self._lat_b = b
+        self._lat_s = s
+        self._lat_k1 = k1
+        self._lat_k2 = k2
+        logger.info(
+            "Prefill attention budget using AUTO-CALIBRATED coeffs: "
+            "M_floor=%.1fms b=%.1fms s=%.5f ms/tok k1=%.3e ms/ctx-tok "
+            "k2=%.3e ms/pair.",
+            M_floor,
+            b,
+            s,
+            k1,
+            k2,
+        )
+
+    def _round_chunk(self, c: int) -> int:
+        """Round a chunk size down to a multiple of the page-aligned step."""
+        r = self._chunk_round
+        return max(r, (c // r) * r) if c >= r else c
+
+    def _attn_budget_token_cap(self, prefix_p: int, num_new: int) -> int:
+        """Max additional prefill tokens admittable at prefix ``prefix_p`` without
+        the running per-step predicted latency ``self._step_lat`` exceeding the
+        budget. Returns 0 if even a minimal chunk doesn't fit (skip this request).
+        The chunk's fixed KV-read cost k1·P is charged on admission, then C is
+        capped by the remaining budget via the same quadratic.
+        """
+        kv_read = self._lat_k1 * prefix_p
+        remaining = self.latency_budget_ms - self._step_lat - kv_read
+        # Amortization floor: the smallest chunk worth running at this prefix
+        # depth. The fixed KV-read cost k1*P is paid once per chunk regardless of
+        # C, so per-token cost s + k1*P/C + k2*(P + C/2) is minimized at
+        # C* = sqrt(2*k1*P/k2). Never chunk a deep prefill below C*: doing so
+        # only re-pays the read on the next step with no benefit. No-op when
+        # k1=0 (no fixed read to amortize) or P=0; bounded by the buffer.
+        c_floor = 0
+        if self._lat_k2 > 0.0 and kv_read > 0.0:
+            c_floor = min(
+                int((2.0 * kv_read / self._lat_k2) ** 0.5),
+                self.max_num_scheduled_tokens,
+            )
+        if remaining <= 0.0:
+            # Guarantee forward progress: if nothing has been admitted this step
+            # yet, let one chunk through (at least the amortization floor, else a
+            # page-rounded minimal chunk) so a single deep request can never
+            # starve, even if it alone exceeds the budget.
+            if self._step_lat <= self._lat_b + 1e-6:
+                return min(num_new, self._round_chunk(max(self._chunk_round, c_floor)))
+            return 0
+        # solve s*C + k2*(C*P + C^2/2) <= remaining for C
+        a = self._lat_k2 / 2.0
+        bb = self._lat_s + self._lat_k2 * prefix_p
+        if a <= 0.0:
+            c = remaining / max(self._lat_s, 1e-9)
+        else:
+            disc = bb * bb + 4.0 * a * remaining
+            c = (-bb + disc**0.5) / (2.0 * a)
+        if c <= 0.0:
+            return 0
+        return min(num_new, self._round_chunk(max(int(c), c_floor)))
+
+    def _charge_step_lat(self, num_new: int, prefix_p: int) -> None:
+        """Add an admitted prefill chunk's predicted cost to the step accumulator."""
+        c = num_new
+        self._step_lat += (
+            self._lat_k1 * prefix_p
+            + self._lat_s * c
+            + self._lat_k2 * (c * prefix_p + c * c / 2.0)
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -435,6 +554,10 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # Reset the per-step attention-budget accumulator to the base step cost.
+        # It grows as prefill chunks are admitted across both the running-
+        # continuation and waiting-new loops below.
+        self._step_lat = self._lat_b
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -508,6 +631,22 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+
+            # Cap this prefill chunk by the per-step attention budget (position-
+            # aware). Decode tokens (generating past the prompt) pass through
+            # uncapped so decode-only steps are unaffected.
+            if (
+                self.latency_budget_ms > 0
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                cap = self._attn_budget_token_cap(
+                    request.num_computed_tokens, num_new_tokens
+                )
+                if cap <= 0:
+                    # Per-step attention budget exhausted: defer this prefill.
+                    req_index += 1
+                    continue
+                num_new_tokens = min(num_new_tokens, cap)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -609,6 +748,11 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if (
+                self.latency_budget_ms > 0
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                self._charge_step_lat(num_new_tokens, request.num_computed_tokens)
             req_index += 1
 
             # Speculative decode related.
@@ -862,6 +1006,18 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+
+                    # Cap this new prefill by the per-step attention budget
+                    # (position-aware). If no headroom remains, stop admitting
+                    # further prefill work this step (the request stays queued).
+                    if self.latency_budget_ms > 0:
+                        cap = self._attn_budget_token_cap(
+                            num_computed_tokens, num_new_tokens
+                        )
+                        if cap <= 0:
+                            break
+                        num_new_tokens = min(num_new_tokens, cap)
+
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1006,6 +1162,8 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if self.latency_budget_ms > 0:
+                    self._charge_step_lat(num_new_tokens, num_computed_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
