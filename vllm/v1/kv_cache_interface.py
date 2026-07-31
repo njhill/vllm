@@ -257,7 +257,7 @@ def compute_layer_kv_cache_shape_bytes(
 
 
 def num_outer_segments(
-    spec: "KVCacheSpec",
+    spec: KVCacheSpec,
     num_layer_slots: int,
     layout: KVCacheLayout,
 ) -> int:
@@ -268,6 +268,7 @@ def num_outer_segments(
     ``S = bytes_per_block / num_segments``, so a grow-only backing (the
     extensible KV cache) can commit a per-segment prefix of blocks.
     """
+    stride_order: tuple[int, ...]
     if getattr(spec, "separate_kv_head_groups", False):
         stride_order = (_DIM_L, _DIM_H, _DIM_B, _DIM_N, _DIM_C)
     else:

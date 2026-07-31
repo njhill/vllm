@@ -528,13 +528,10 @@ def get_kv_cache_block_regions(
     for entries in storage_groups.values():
         first_name, first_tensor = entries[0]
         storage = first_tensor.untyped_storage()
+        # Upper bound only: with the extensible KV cache the storage spans
+        # the reserved virtual-address capacity, so all block geometry is
+        # derived from the views (which cover exactly the committed extent).
         storage_nbytes = storage.nbytes()
-        if storage_nbytes % num_blocks != 0:
-            raise ValueError(
-                f"KV cache storage for {first_name!r} has {storage_nbytes} bytes, "
-                f"which is not divisible by {num_blocks} blocks"
-            )
-        storage_block_bytes = storage_nbytes // num_blocks
 
         tensor_block_bytes: dict[int, int] = {}
         for _, tensor in entries:
@@ -553,13 +550,24 @@ def get_kv_cache_block_regions(
             storage, 0, (storage_nbytes,)
         )
 
-        # A block stride spanning the complete storage block means the storage
-        # itself is block-major (for example BLHNC/BHLNC). Copy it exactly once.
-        if any(
-            tensor_block_bytes[id(tensor)] == storage_block_bytes
-            for _, tensor in entries
-        ):
-            regions[first_name] = raw.view(num_blocks, storage_block_bytes)
+        # A block stride wider than the view's own content means other
+        # layers are interleaved within it: the storage is block-major
+        # (for example BLHNC/BHLNC). Copy each storage block exactly once.
+        block_major_bytes = next(
+            (
+                tensor_block_bytes[id(tensor)]
+                for _, tensor in entries
+                if tensor_block_bytes[id(tensor)] * num_blocks > tensor.nbytes
+            ),
+            None,
+        )
+        if block_major_bytes is not None:
+            end = num_blocks * block_major_bytes
+            if end > storage_nbytes:
+                raise ValueError(
+                    f"KV cache region for {first_name!r} exceeds its backing storage"
+                )
+            regions[first_name] = raw[:end].view(num_blocks, block_major_bytes)
             continue
 
         for name, tensor in entries:

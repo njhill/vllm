@@ -11,16 +11,16 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.utils.extensible_tensor import (
+    ExtensibleKVCacheBuffers,
+    ExtensibleTensor,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-from vllm.utils.extensible_tensor import (
-    ExtensibleKVCacheBuffers,
-    ExtensibleTensor,
-)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
