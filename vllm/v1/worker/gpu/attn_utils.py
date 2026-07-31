@@ -17,12 +17,17 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.utils.extensible_tensor import (
+    ExtensibleKVCacheBuffers,
+    ExtensibleTensor,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheLayout,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
+    num_outer_segments,
     reshape_kv_cache,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -181,7 +186,9 @@ def _allocate_and_reshape_kv_cache(
     layout: KVCacheLayout | None = None,
     kernel_block_sizes: list[int] | None = None,
     attn_backends: tuple[type[AttentionBackend], ...] | None = None,
-) -> dict[str, Any]:
+    extensible: bool = False,
+    shareable: bool = False,
+) -> tuple[dict[str, Any], ExtensibleKVCacheBuffers | None]:
     if layout is None:
         layout = resolve_kv_cache_layout(
             tuple(attn_backends) if attn_backends else None
@@ -197,9 +204,38 @@ def _allocate_and_reshape_kv_cache(
                 layer_to_group[layer_name] = (spec, group_id)
 
     kv_caches: dict[str, Any] = {}
+    extensible_buffers: list[tuple[ExtensibleTensor, int]] = []
+    total_num_blocks = kv_cache_config.num_blocks
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         num_layer_slots = len(kv_cache_tensor.shared_by)
-        buf = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        if extensible:
+            # One VMM-backed buffer per tensor, committed as a per-segment
+            # prefix of blocks; segmentation follows the physical layout
+            # (dims outer to the block dim, e.g. layer slots under LBHNC).
+            tensor_layers = {n for slot in kv_cache_tensor.shared_by for n in slot}
+            segment_counts = {
+                num_outer_segments(spec, num_layer_slots, layout)
+                for name, (spec, _) in layer_to_group.items()
+                if name in tensor_layers
+            }
+            assert len(segment_counts) == 1, (
+                "Layers sharing one KV cache tensor disagree on the buffer "
+                f"segmentation ({segment_counts}): {kv_cache_tensor.shared_by}"
+            )
+            num_segments = segment_counts.pop()
+            bytes_per_block = kv_cache_tensor.size // total_num_blocks
+            assert bytes_per_block * total_num_blocks == kv_cache_tensor.size
+            assert bytes_per_block % num_segments == 0
+            buffer = ExtensibleTensor(
+                max_num_bytes=kv_cache_tensor.size,
+                device=device,
+                num_segments=num_segments,
+                shareable=shareable,
+            )
+            extensible_buffers.append((buffer, bytes_per_block // num_segments))
+            buf = buffer.full_view()
+        else:
+            buf = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
 
         layer_to_slot: dict[str, int] = {}
         for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
@@ -236,7 +272,11 @@ def _allocate_and_reshape_kv_cache(
             for layer_name in layer_names:
                 kv_caches[layer_name] = views[layer_to_slot[layer_name]]
 
-    return kv_caches
+    if not extensible:
+        return kv_caches, None
+    buffers = ExtensibleKVCacheBuffers(extensible_buffers, total_num_blocks)
+    buffers.commit(1)
+    return kv_caches, buffers
 
 
 def init_kv_cache(
@@ -249,14 +289,21 @@ def init_kv_cache(
     kernel_block_sizes: list[int] | None = None,
     layout: KVCacheLayout | None = None,
     vllm_config: VllmConfig | None = None,
-) -> dict[str, Any]:
-    kv_caches = _allocate_and_reshape_kv_cache(
+    extensible: bool = False,
+) -> tuple[dict[str, Any], ExtensibleKVCacheBuffers | None]:
+    kv_caches, extensible_buffers = _allocate_and_reshape_kv_cache(
         kv_cache_config,
         device,
         layout=layout,
         kernel_block_sizes=kernel_block_sizes,
         attn_backends=tuple(
             group.backend for groups in attn_groups for group in groups
+        ),
+        extensible=extensible,
+        # KV connectors export this memory for cross-process access
+        # (CUDA IPC intra-node, GPU-direct RDMA across nodes).
+        shareable=(
+            vllm_config is not None and vllm_config.kv_transfer_config is not None
         ),
     )
 
@@ -274,7 +321,41 @@ def init_kv_cache(
         ):
             num_attn_module = 2
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
-    return kv_caches
+    return kv_caches, extensible_buffers
+
+
+def narrow_kv_caches_to_num_blocks(
+    kv_caches: dict[str, torch.Tensor],
+    attn_groups: Sequence[AttentionGroup],
+    kernel_block_sizes: list[int],
+    num_blocks: int,
+) -> dict[str, torch.Tensor]:
+    """Return views of the KV caches narrowed to the first `num_blocks` blocks.
+
+    With the extensible KV cache, the layer views span the full reserved
+    capacity while only a block prefix is physically committed. KV connectors
+    must only see (and register) backed memory, so hand them views whose
+    (logical) block dimension is trimmed to the committed count. Since
+    committed blocks form a prefix of each physical layout segment, the
+    narrowed views cover exactly the committed bytes.
+    """
+    narrowed = dict(kv_caches)
+    for group in attn_groups:
+        if group.kv_cache_group_id >= len(kernel_block_sizes):
+            continue
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, AttentionSpec):
+            # Mirror the virtual block split of _allocate_and_reshape_kv_cache.
+            ratio = spec.block_size // kernel_block_sizes[group.kv_cache_group_id]
+        else:
+            ratio = 1
+        for layer_name in group.layer_names:
+            kv_cache = kv_caches.get(layer_name)
+            if kv_cache is not None:
+                narrowed[layer_name] = kv_cache.narrow(0, 0, num_blocks * ratio)
+    return narrowed
 
 
 def build_slot_mappings_by_layer(
