@@ -7402,18 +7402,12 @@ class GPUModelRunner(
         self.extensible_kv_buffers = builder.finish() if builder is not None else None
         return kv_caches
 
-    def extend_kv_cache(self, num_blocks: int, defragment: bool = False) -> None:
-        """Commit physical pages so the KV cache holds `num_blocks` blocks.
-
-        Grows the KV cache after CUDA graph capture, once the available memory
-        is known. No re-view is needed: the layers already view the full
-        capacity and each block stays at a fixed offset within its layout
-        segment, so captured graphs stay valid as more pages are mapped under
-        the stable base pointer. Newly committed blocks are zeroed.
-        """
+    def extend_kv_cache(self, num_blocks: int) -> None:
+        """Grow the KV cache to `num_blocks` blocks after CUDA graph capture,
+        once the available memory is known."""
         if self.extensible_kv_buffers is None:
             raise RuntimeError("extend_kv_cache requires an extensible KV cache.")
-        self.extensible_kv_buffers.commit(num_blocks, defragment=defragment)
+        self.extensible_kv_buffers.commit(num_blocks)
         self.kv_cache_config.num_blocks = num_blocks
         logger.info("Extended KV cache to %d blocks.", num_blocks)
 

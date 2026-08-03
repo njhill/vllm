@@ -12,8 +12,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from vllm.utils.extensible_tensor import ExtensibleKVCacheBuffers
-from vllm.utils.vmm_driver import get_vmm_driver, vmm_unavailable_reason
+from vllm.utils.extensible_tensor import ExtensibleKVCacheBuffers, granule_size
+from vllm.utils.vmm_driver import vmm_unavailable_reason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -118,7 +118,7 @@ def test_extensible_allocation_and_growth(layout):
     assert buffers.num_blocks_committed == 1
     # Physical commit is granule-rounded per segment: one committed block
     # maps at most one granule in each segment.
-    granule = get_vmm_driver().granularity(0)
+    granule = granule_size(0)
     num_segments = 2 if layout is KVCacheLayout.LBHNC else 1
     assert 0 < buffers.physical_bytes <= num_segments * granule
 
@@ -133,11 +133,64 @@ def test_extensible_allocation_and_growth(layout):
     assert buffers.num_blocks_committed == NUM_BLOCKS
     for name, view in kv_caches.items():
         assert view.data_ptr() == ptrs_before[name]
+        # Growth re-maps the prefix, so earlier contents are discarded and the
+        # whole committed range reads as zero -- and stays writable.
+        assert view[0].eq(0).all()
         view[NUM_BLOCKS - 1].fill_(2.0)
-        # Earlier contents survive the grow; new blocks were zeroed.
-        assert view[0].eq(1.0).all()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     buffers.free()
+
+
+@requires_vmm
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.BLHNC])
+def test_grow_maps_equal_sized_allocations(layout):
+    """Every physical allocation in a reservation has the same size.
+
+    ROCm's hipMemSetAccess (before ROCm/rocm-systems#2451) only accepts a
+    range whose size matches a prefix sum of the reservation's allocations,
+    walked in an arbitrary order -- which holds for every order only when the
+    allocations are equal-sized. Mixed sizes fail non-deterministically.
+    """
+    config = _single_group_config(_attn_spec(), num_layer_slots=2)
+    _, buffers = _allocate_and_reshape_kv_cache(
+        config, torch.device("cuda:0"), layout=layout, extensible=True
+    )
+    try:
+        for num_blocks in (1, NUM_BLOCKS // 2, NUM_BLOCKS):
+            buffers.commit(num_blocks)
+            for buffer, _ in buffers.buffers:
+                sizes = {size for _, _, size in buffer._buffer._handles}
+                assert len(sizes) == 1, (
+                    f"mixed allocation sizes {sizes} after commit({num_blocks})"
+                )
+    finally:
+        buffers.free()
+
+
+@requires_vmm
+def test_commit_at_or_below_committed_preserves_data():
+    """A non-growing commit must not touch the mapping.
+
+    Elastic EP re-runs warmup (and hence `ensure_blocks`) while the KV cache
+    holds live data; re-mapping there would silently discard it.
+    """
+    config = _single_group_config(_attn_spec())
+    kv_caches, buffers = _allocate_and_reshape_kv_cache(
+        config, torch.device("cuda:0"), layout=KVCacheLayout.LBHNC, extensible=True
+    )
+    try:
+        buffers.commit(NUM_BLOCKS)
+        view = kv_caches["layer.0"]
+        view.fill_(7.0)
+        torch.accelerator.synchronize()
+
+        buffers.ensure_blocks(1)
+        buffers.commit(NUM_BLOCKS)
+        assert buffers.num_blocks_committed == NUM_BLOCKS
+        torch.accelerator.synchronize()
+        assert view.eq(7.0).all()
+    finally:
+        buffers.free()
 
 
 @requires_vmm

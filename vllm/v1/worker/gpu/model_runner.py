@@ -557,11 +557,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.extensible_kv_buffers is not None:
             self.extensible_kv_buffers.ensure_blocks(num_blocks)
 
-    def extend_kv_cache(self, num_blocks: int, defragment: bool = False) -> None:
+    def extend_kv_cache(self, num_blocks: int) -> None:
         """Grow the KV cache to `num_blocks` blocks after warmup."""
         if self.extensible_kv_buffers is None:
             raise RuntimeError("extend_kv_cache requires an extensible KV cache.")
-        self.extensible_kv_buffers.extend(num_blocks, defragment=defragment)
+        self.extensible_kv_buffers.extend(num_blocks)
         self.kv_cache_config.num_blocks = num_blocks
 
     @property

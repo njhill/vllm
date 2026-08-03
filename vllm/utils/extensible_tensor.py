@@ -19,6 +19,24 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+# Floor for the commit granule. ROCm reports a 4 KiB allocation granularity
+# (CUDA reports 2 MiB), which would put tens of millions of granules in the
+# bookkeeping below for a large KV cache. Commit in larger units instead.
+_MIN_GRANULARITY = 2 << 20
+
+
+def granule_size(device_index: int) -> int:
+    """Size of the units physical memory is committed in, for `device_index`.
+
+    At least `_MIN_GRANULARITY`, and always a multiple of what the driver
+    requires.
+    """
+    driver_granularity = get_vmm_driver().granularity(device_index)
+    return _round_up(
+        max(driver_granularity, _MIN_GRANULARITY), driver_granularity
+    )
+
+
 class _VirtualBuffer:
     """Own one device VA reservation and the physical chunks mapped into it.
 
@@ -36,7 +54,7 @@ class _VirtualBuffer:
         self.device_index = device_index
         self._shareable = shareable
 
-        self.granularity: int = self._driver.granularity(device_index)
+        self.granularity: int = granule_size(device_index)
         self.reserved_size: int = _round_up(max(max_bytes, 1), self.granularity)
         self.base_ptr: int = self._driver.reserve(self.reserved_size)
 
@@ -74,6 +92,7 @@ class _VirtualBuffer:
             return
         first = start // self.granularity
         last = (end + self.granularity - 1) // self.granularity  # exclusive
+        mapped: list[tuple[int, int]] = []
         run_start: int | None = None
         for g in range(first, last + 1):
             unmapped = g < last and g not in self._mapped_granules
@@ -84,7 +103,34 @@ class _VirtualBuffer:
                     run_start * self.granularity, (g - run_start) * self.granularity
                 )
                 self._mapped_granules.update(range(run_start, g))
+                mapped.append((run_start, g))
                 run_start = None
+
+        for chunk_first, chunk_last in mapped:
+            self._grant_access(*self._run_bounds(chunk_first, chunk_last))
+
+    def _run_bounds(self, first: int, last: int) -> tuple[int, int]:
+        """Granule bounds of the maximal contiguous mapped run covering the
+        granules `[first, last)`."""
+        while first - 1 in self._mapped_granules:
+            first -= 1
+        while last in self._mapped_granules:
+            last += 1
+        return first, last
+
+    def _grant_access(self, first: int, last: int) -> None:
+        """Grant device access over the whole granule run `[first, last)`.
+
+        Access is granted per contiguous *run* rather than per newly mapped
+        chunk: ROCm rejects a set-access range that starts partway into an
+        already-mapped region. Re-granting over the earlier part of the run is
+        a no-op, and cheap -- the driver call is flat in the range size.
+        """
+        self._driver.set_access(
+            self.base_ptr + first * self.granularity,
+            (last - first) * self.granularity,
+            self.device_index,
+        )
 
     def _map_chunk_at(self, offset: int, size: int) -> None:
         """Create one physical chunk of `size` bytes and map it at `offset`."""
@@ -111,8 +157,7 @@ class _VirtualBuffer:
         except RuntimeError:
             driver.release(handle)
             raise
-        driver.set_access(addr, size, self.device_index)
-
+        # Access is granted by the caller, per contiguous run.
         self._handles.append((handle, offset, size))
 
     def release_physical(self) -> None:
@@ -386,8 +431,9 @@ class ExtensibleKVCacheBuffers:
     buffer per KV cache tensor, committed as a per-segment prefix of blocks.
 
     `commit` maps (and zeroes) physical pages for additional blocks while
-    keeping every buffer's base pointer, existing data, and the logical views
-    built over the full reserved capacity stable.
+    keeping every buffer's base pointer and the logical views built over the
+    full reserved capacity stable. Growth discards previously committed
+    contents -- see `commit`.
     """
 
     def __init__(
@@ -401,23 +447,37 @@ class ExtensibleKVCacheBuffers:
         self.num_blocks_committed = 0
         self._num_blocks_to_recommit = 0
 
-    def commit(self, num_blocks: int, defragment: bool = False) -> None:
+    def commit(self, num_blocks: int) -> None:
         """Grow the committed prefix of every buffer to `num_blocks` blocks.
 
-        With `defragment=True`, all previously committed physical chunks are
-        released first so each segment's prefix is re-mapped as one physical
-        allocation. Existing contents are DISCARDED, so this is only valid
-        before real KV data exists (e.g. right after warmup). It is required
-        before KV-transfer registration: UCX cannot transfer memory regions
-        that span multiple VMM allocation handles.
+        Growth re-maps each segment's prefix as a *single* physical allocation:
+        the pages committed so far are released first, so their contents are
+        DISCARDED and the whole new prefix is zeroed. Base pointers and the
+        views built over the full reserved capacity stay valid throughout, so
+        captured CUDA graphs survive.
+
+        Discarding is safe because growth only happens before serving starts
+        (allocation, warmup, and the post-warmup sizing pass), where the only
+        KV data is warmup garbage. Two constraints require the single
+        allocation per segment:
+
+        - UCX cannot transfer a VMM region that spans multiple allocation
+          handles, so KV-transfer registration needs one handle per segment.
+        - ROCm's `hipMemSetAccess` before ROCm/rocm-systems#2451 accepts a
+          range only when its size equals a prefix sum of the reservation's
+          allocations, walked in an arbitrary order. Equal-sized allocations
+          satisfy that for *every* order; mixed sizes fail non-deterministically
+          (measured: 19/20 failures with mixed sizes, 0/20 when equal).
+
+        A request at or below the committed size returns without touching the
+        mapping. That is what keeps a runtime `ensure_blocks` call -- elastic
+        EP re-runs warmup while KV data is live -- from discarding the cache.
         """
-        if defragment and self.num_blocks_committed > 0:
-            self.release_physical()
         if num_blocks <= self.num_blocks_committed:
             return
+        if self.num_blocks_committed > 0:
+            self._release()
         for buffer, bytes_per_block_per_segment in self.buffers:
-            # Zero only the freshly committed blocks; existing ones are left
-            # intact.
             buffer.resize_per_segment_(
                 num_blocks * bytes_per_block_per_segment, zero_new=True
             )
@@ -431,28 +491,25 @@ class ExtensibleKVCacheBuffers:
         """
         self.commit(min(num_blocks, self.num_blocks_capacity))
 
-    def extend(self, num_blocks: int, defragment: bool = False) -> None:
+    def extend(self, num_blocks: int) -> None:
         """Grow the KV cache to `num_blocks` blocks once the memory actually
-        available after warmup and CUDA graph capture is known.
-
-        No re-view is needed: the layers already view the full reserved
-        capacity and each block stays at a fixed offset within its layout
-        segment, so captured graphs stay valid as more pages are mapped under
-        the stable base pointer. Newly committed blocks are zeroed.
-        """
-        self.commit(num_blocks, defragment=defragment)
+        available after warmup and CUDA graph capture is known."""
+        self.commit(num_blocks)
         logger.info("Extended KV cache to %d blocks.", num_blocks)
 
     @property
     def physical_bytes(self) -> int:
         return sum(buffer.physical_bytes for buffer, _ in self.buffers)
 
-    def release_physical(self) -> None:
-        """Discard all physical memory (sleep), keeping VA and views valid."""
-        self._num_blocks_to_recommit = self.num_blocks_committed
+    def _release(self) -> None:
         for buffer, _ in self.buffers:
             buffer.release_physical()
         self.num_blocks_committed = 0
+
+    def release_physical(self) -> None:
+        """Discard all physical memory (sleep), keeping VA and views valid."""
+        self._num_blocks_to_recommit = self.num_blocks_committed
+        self._release()
 
     def recommit(self) -> None:
         """Re-commit the pre-release block count with freshly zeroed pages."""

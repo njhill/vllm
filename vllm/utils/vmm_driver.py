@@ -12,6 +12,7 @@ reservation, and set access permissions.
 from __future__ import annotations
 
 import ctypes
+from contextlib import suppress
 from functools import cache
 from typing import Any
 
@@ -347,8 +348,24 @@ def vmm_unavailable_reason() -> str | None:
         device_index = torch.accelerator.current_device_index()
         driver.ensure_context(device_index)
         granularity = driver.granularity(device_index)
-        ptr = driver.reserve(granularity)
-        driver.free_reserved(ptr, granularity)
+        # Exercise a two-chunk grow, not just a reservation: growing is where
+        # platforms differ (ROCm rejects granting access for a range that
+        # starts partway into an already-mapped region), and a driver that
+        # cannot grow is unusable for an extensible KV cache.
+        ptr = driver.reserve(2 * granularity)
+        mapped: list[tuple[int, int]] = []
+        try:
+            for offset in (0, granularity):
+                handle = driver.create(granularity, device_index)
+                mapped.append((handle, offset))
+                driver.map(ptr + offset, granularity, handle)
+                driver.set_access(ptr, offset + granularity, device_index)
+        finally:
+            for handle, offset in mapped:
+                with suppress(Exception):
+                    driver.unmap(ptr + offset, granularity)
+                    driver.release(handle)
+            driver.free_reserved(ptr, 2 * granularity)
     except Exception as e:
         return str(e)
     return None
