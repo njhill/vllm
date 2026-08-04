@@ -75,6 +75,8 @@ def _compute_global_residual_mass(
         # so the residual mass reduces to the closed form:
         #   p * (1 - M_b(draft_token)).
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # Avoid possible OOB ptr access on the -1 placeholder.
+        draft_token = tl.maximum(0, draft_token)
         target_lse = _compute_global_logsumexp(
             target_local_max_ptr,
             target_local_max_stride,
@@ -340,6 +342,8 @@ def _compute_cumulative_log_p_kernel(
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # Avoid possible OOB ptr access on the -1 placeholder.
+        draft_token = tl.maximum(0, draft_token)
         target_logprob, draft_logprob, _, _ = _compute_global_logprobs_and_logsumexp(
             draft_token,
             True,  # mask
@@ -530,6 +534,10 @@ def _rejection_kernel(
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # -1 is used for padded draft token ids that should be rejected.
+        is_valid_draft = draft_sampled >= 0
+        # Avoid possible OOB ptr access.
+        draft_sampled = tl.maximum(0, draft_sampled)
         pos = tl.load(pos_ptr + logit_idx)
         u = tl_rand32(seed, pos, includes_zero=False)
         if USE_BLOCK_VERIFICATION and not is_greedy:
@@ -558,7 +566,9 @@ def _rejection_kernel(
                 h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
             else:
                 h = prefix_joint_ratio
-            accepted_length = tl.where(u <= h, i + 1, accepted_length)
+            accepted_length = tl.where(
+                (u <= h) & is_valid_draft, i + 1, accepted_length
+            )
             tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
         elif accepted:
             if is_greedy:
@@ -576,20 +586,16 @@ def _rejection_kernel(
                 )
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
-                    # -1 is used for padded draft token ids that should be rejected.
-                    accepted &= (u < rate) & (draft_sampled >= 0)
+                    accepted &= u < rate
                 else:
                     accepted &= target_argmax == draft_sampled
+                accepted &= is_valid_draft
                 tl.store(
                     sampled_ptr + req_idx * sampled_stride + i,
                     draft_sampled if accepted else target_argmax,
                 )
             else:
                 # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
-                # -1 is used for padded draft token ids that should be rejected.
-                is_valid_draft = draft_sampled >= 0
-                # Avoid possible OOB ptr access.
-                draft_sampled = tl.maximum(0, draft_sampled)
                 target_logprob, draft_logprob, target_lse, draft_lse = (
                     _compute_global_logprobs_and_logsumexp(
                         draft_sampled,
