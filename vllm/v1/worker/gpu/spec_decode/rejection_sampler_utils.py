@@ -74,9 +74,8 @@ def _compute_global_residual_mass(
         # One-hot draft. M_s is a point mass at this draft token
         # so the residual mass reduces to the closed form:
         #   p * (1 - M_b(draft_token)).
+        # The caller guarantees this position is not a -1 placeholder.
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
-        # Avoid possible OOB ptr access on the -1 placeholder.
-        draft_token = tl.maximum(0, draft_token)
         target_lse = _compute_global_logsumexp(
             target_local_max_ptr,
             target_local_max_stride,
@@ -144,6 +143,9 @@ def _compute_global_logprobs_and_logsumexp(
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
 ):
+    # Clamp -1 placeholder draft ids so the loads below stay in bounds.
+    # Callers must reject placeholder positions separately.
+    token = tl.maximum(0, token)
     target_logit = tl.load(
         target_logits_ptr + logit_idx * target_logits_stride + token,
         mask=mask,
@@ -338,36 +340,39 @@ def _compute_cumulative_log_p_kernel(
     if temp == 0.0:
         return
 
-    log_p = 0.0
+    log_p = tl.zeros((), tl.float32)
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
-        # Avoid possible OOB ptr access on the -1 placeholder.
-        draft_token = tl.maximum(0, draft_token)
-        target_logprob, draft_logprob, _, _ = _compute_global_logprobs_and_logsumexp(
-            draft_token,
-            True,  # mask
-            logit_idx,
-            req_state_idx,
-            step,
-            target_logits_ptr,
-            target_logits_stride,
-            target_local_max_ptr,
-            target_local_max_stride,
-            target_local_sumexp_ptr,
-            target_local_sumexp_stride,
-            draft_logits_ptr,
-            draft_logits_stride_0,
-            draft_logits_stride_1,
-            draft_local_max_ptr,
-            draft_local_max_stride,
-            draft_local_sumexp_ptr,
-            draft_local_sumexp_stride,
-            vocab_num_blocks,
-            PADDED_VOCAB_NUM_BLOCKS,
-            HAS_DRAFT_LOGITS,
-        )
-        log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+        # -1 placeholder positions can never be accepted; skip their
+        # reductions and carry the last valid cumulative value.
+        if draft_token >= 0:
+            target_logprob, draft_logprob, _, _ = (
+                _compute_global_logprobs_and_logsumexp(
+                    draft_token,
+                    True,  # mask
+                    logit_idx,
+                    req_state_idx,
+                    step,
+                    target_logits_ptr,
+                    target_logits_stride,
+                    target_local_max_ptr,
+                    target_local_max_stride,
+                    target_local_sumexp_ptr,
+                    target_local_sumexp_stride,
+                    draft_logits_ptr,
+                    draft_logits_stride_0,
+                    draft_logits_stride_1,
+                    draft_local_max_ptr,
+                    draft_local_max_stride,
+                    draft_local_sumexp_ptr,
+                    draft_local_sumexp_stride,
+                    vocab_num_blocks,
+                    PADDED_VOCAB_NUM_BLOCKS,
+                    HAS_DRAFT_LOGITS,
+                )
+            )
+            log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -398,6 +403,8 @@ def _compute_local_residual_mass_kernel(
     draft_local_sumexp_ptr,
     draft_local_sumexp_stride,
     # [num_logits]
+    draft_sampled_ptr,
+    # [num_logits]
     expanded_idx_mapping_ptr,
     # [num_logits]
     expanded_local_pos_ptr,
@@ -415,6 +422,11 @@ def _compute_local_residual_mass_kernel(
         # The acceptance threshold, h, looks one position ahead and sums
         # over: max(p_i * M_b(x|x_{<i}) - M_s(x|x_{<i}), 0). Tokens at the
         # first and last (bonus) positions aren't needed for this computation.
+        return
+
+    if tl.load(draft_sampled_ptr + logit_idx + 1) < 0:
+        # -1 placeholder: the rejection kernel treats the preceding token as
+        # the end of the block, so this position's residual mass is unused.
         return
 
     req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
@@ -531,12 +543,14 @@ def _rejection_kernel(
     target_lse = 0.0
     draft_lse = 0.0
     accepted = True
+    valid_prefix = True
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
-        # -1 is used for padded draft token ids that should be rejected.
-        is_valid_draft = draft_sampled >= 0
-        # Avoid possible OOB ptr access.
+        # -1 marks a padded draft token id; nothing at or after it can be
+        # accepted.
+        valid_prefix &= draft_sampled >= 0
+        # Keep stored/compared token ids in range.
         draft_sampled = tl.maximum(0, draft_sampled)
         pos = tl.load(pos_ptr + logit_idx)
         u = tl_rand32(seed, pos, includes_zero=False)
@@ -545,7 +559,14 @@ def _rejection_kernel(
             prefix_joint_ratio = tl.exp(
                 tl.load(cumulative_log_p_ptr + logit_idx).to(tl.float32)
             )
-            if i < num_draft_tokens - 1:
+            # A -1 placeholder has no meaningful logits or cumulative log-p,
+            # so the last real draft token is the effective end of the block.
+            next_draft = tl.load(
+                draft_sampled_ptr + logit_idx + 2,
+                mask=i < num_draft_tokens - 1,
+                other=-1,
+            )
+            if next_draft >= 0:
                 residual_mass = _compute_global_residual_mass(
                     local_residual_mass_ptr,
                     local_residual_mass_stride,
@@ -566,9 +587,7 @@ def _rejection_kernel(
                 h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
             else:
                 h = prefix_joint_ratio
-            accepted_length = tl.where(
-                (u <= h) & is_valid_draft, i + 1, accepted_length
-            )
+            accepted_length = tl.where((u <= h) & valid_prefix, i + 1, accepted_length)
             tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
         elif accepted:
             if is_greedy:
@@ -589,7 +608,7 @@ def _rejection_kernel(
                     accepted &= u < rate
                 else:
                     accepted &= target_argmax == draft_sampled
-                accepted &= is_valid_draft
+                accepted &= valid_prefix
                 tl.store(
                     sampled_ptr + req_idx * sampled_stride + i,
                     draft_sampled if accepted else target_argmax,
@@ -628,7 +647,7 @@ def _rejection_kernel(
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
                     accepted &= target_logprob > tl.log(u) + draft_logprob
-                accepted &= is_valid_draft
+                accepted &= valid_prefix
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             accepted_length += accepted
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
@@ -1016,6 +1035,7 @@ def rejection_sample(
                 draft_local_max.stride(0),
                 draft_local_sumexp,
                 draft_local_sumexp.stride(0),
+                draft_sampled,
                 expanded_idx_mapping,
                 expanded_local_pos,
                 temperature,
