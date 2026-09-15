@@ -470,7 +470,7 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     global_batch.dcp_local_seq_lens = global_buffers.dcp_local_seq_lens[:2]
     global_batch.dcp_local_seq_lens.fill_(-1)
 
-    local_batch = manager.partition_batch(
+    local_batch = manager._partition_batch(
         global_batch,
         padded_num_tokens=4,
         padded_num_reqs=4,
@@ -489,7 +489,7 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
 
     # What execute_model does next: derive DCP metadata from the final batch
     # on the PCP-owned buffers.
-    local_batch.dcp_local_seq_lens = gpu_cp_utils.maybe_prepare_dcp_local_seq_lens(
+    local_batch.dcp_local_seq_lens = gpu_cp_utils.prepare_dcp_local_seq_lens(
         manager.input_buffers.dcp_local_seq_lens,
         local_batch.seq_lens,
         local_batch.num_reqs,

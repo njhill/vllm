@@ -90,7 +90,7 @@ def test_maybe_prepare_dcp_local_seq_lens_uses_shared_buffer(monkeypatch):
             return fake_kernel
 
     monkeypatch.setattr(cp_utils, "_dcp_local_seq_lens_kernel", FakeKernel())
-    batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
+    batch.dcp_local_seq_lens = cp_utils.prepare_dcp_local_seq_lens(
         buffers.dcp_local_seq_lens,
         batch.seq_lens,
         batch.num_reqs,
@@ -103,33 +103,6 @@ def test_maybe_prepare_dcp_local_seq_lens_uses_shared_buffer(monkeypatch):
     assert batch.dcp_local_seq_lens is not None
     assert batch.dcp_local_seq_lens.data_ptr() == buffers.dcp_local_seq_lens.data_ptr()
     assert batch.dcp_local_seq_lens.tolist() == [1, 2, 0, 0]
-
-
-def test_maybe_prepare_dcp_local_seq_lens_clears_stale_metadata(monkeypatch):
-    """dcp_size == 1 resets the field to None instead of leaving a leftover.
-
-    DCP is toggled per deployment, and batches are recycled; a value from an
-    earlier DCP batch would otherwise be consumed as if it were current.
-    """
-    buffers = InputBuffers(max_num_reqs=2, max_num_tokens=2, device=torch.device("cpu"))
-    batch = InputBatch.make_dummy(1, 1, buffers)
-    batch.dcp_local_seq_lens = buffers.dcp_local_seq_lens[:1]
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("kernel must not run with dcp_size == 1")
-
-    monkeypatch.setattr(cp_utils, "_dcp_local_seq_lens_kernel", fail_if_called)
-    batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
-        buffers.dcp_local_seq_lens,
-        batch.seq_lens,
-        batch.num_reqs,
-        1,
-        0,
-        1,
-        num_reqs_padded=batch.num_reqs_after_padding,
-    )
-
-    assert batch.dcp_local_seq_lens is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernel needs CUDA")
@@ -147,7 +120,7 @@ def test_maybe_prepare_dcp_local_seq_lens_matches_reference(
 
     for dcp_rank in range(dcp_size):
         buffers.dcp_local_seq_lens.fill_(-1)
-        batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
+        batch.dcp_local_seq_lens = cp_utils.prepare_dcp_local_seq_lens(
             buffers.dcp_local_seq_lens,
             batch.seq_lens,
             batch.num_reqs,

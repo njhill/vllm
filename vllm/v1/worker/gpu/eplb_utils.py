@@ -110,11 +110,7 @@ class EPLBController:
         if eplb_models_added and self.state is not None and self.state.is_async:
             self.state.start_async_loop()
 
-    def step(
-        self,
-        is_dummy: bool = False,
-        is_profile: bool = False,
-    ) -> None:
+    def step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         if (
             not self.parallel_config.enable_eplb
             or self.suppressed
