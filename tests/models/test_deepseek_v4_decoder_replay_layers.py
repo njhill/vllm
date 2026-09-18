@@ -229,3 +229,71 @@ def test_replay_break_matches_eager():
     assert torch.equal(pre_mix_out, expected[1])
     assert torch.equal(outputs[0], expected[0])
     assert torch.equal(outputs[1], expected[1])
+
+
+def _supported_model(num_layers=40, cut=20):
+    """DeepseekV4Model._decoder_replay_supported bound to a namespace holding
+    just the state it uses (V4.1-Flash values by default)."""
+    model = SimpleNamespace(
+        start_layer=0,
+        end_layer=num_layers,
+        use_sequence_parallel=False,
+        config=SimpleNamespace(
+            num_hidden_layers=num_layers,
+            sliding_window=WINDOW,
+            engram_layer_ids=[1, 14],
+        ),
+    )
+    model._decoder_replay_supported = MethodType(
+        DeepseekV4Model._decoder_replay_supported, model
+    )
+    model._drafter_aux_layers = MethodType(DeepseekV4Model._drafter_aux_layers, model)
+    return model
+
+
+def _vllm_config(spec_config):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, use_ubatching=False
+        ),
+        speculative_config=spec_config,
+    )
+
+
+def _dspark_config(target_layer_ids, method="dspark"):
+    return SimpleNamespace(
+        method=method,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v41",
+                sliding_window=WINDOW,
+                layer_types=["sliding_attention"],
+                dspark_target_layer_ids=target_layer_ids,
+            )
+        ),
+    )
+
+
+def test_decoder_replay_supported_with_dspark_aux_layers():
+    """DS4.1's drafter reads aux hidden states of the last three layers, all
+    past the last KV source: decoder replay stays on."""
+    model = _supported_model()
+    cfg = _vllm_config(_dspark_config([37, 38, 39]))
+    assert model._decoder_replay_supported(cfg, 20)
+
+
+def test_decoder_replay_off_when_drafter_reads_prefix_aux_layers():
+    """A drafter reading aux hidden states captured at or before the last KV
+    source layer (e.g. the EAGLE3 default) turns decoder replay off: those
+    layers keep running the full batch, and the replay forward returns no aux
+    for them."""
+    model = _supported_model()
+    assert not model._decoder_replay_supported(
+        _vllm_config(_dspark_config([20, 38, 39])), 20
+    )
+    # The EAGLE3 default aux layers span the model.
+    assert not model._decoder_replay_supported(
+        _vllm_config(SimpleNamespace(method="eagle3", draft_model_config=None)), 20
+    )
+    # No drafter: no constraint from aux hidden states.
+    assert model._decoder_replay_supported(_vllm_config(None), 20)

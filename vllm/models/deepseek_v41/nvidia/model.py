@@ -14,7 +14,7 @@ from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphCapture,
     is_breakable_cudagraph_enabled,
 )
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_engram_dp_size,
@@ -811,14 +811,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # Per-row indexer outputs the source publishes for the layers
             # after it.
             source_attn = self.layers[cut].attn
-            self._replay_row_buffers = [
-                buf
-                for buf in (
-                    source_attn.topk_indices_buffer,
-                    source_attn.candidate_block_buffer,
-                )
-                if buf is not None
-            ]
+            bufs = (source_attn.topk_indices_buffer, source_attn.candidate_block_buffer)
+            self._replay_row_buffers = [buf for buf in bufs if buf is not None]
             # Under breakable piecewise graphs the replay runs as an eager
             # break of the model graph; the graph's post-break segments read
             # the replay's outputs at fixed addresses: static buffers, sized
@@ -1017,9 +1011,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_mask,
             mega_gate_metadata,
         )
-        late_aux: list[torch.Tensor] = []
         if self.decoder_replay_start < self.end_layer:
-            hidden_states, pre_mix, *late_aux = self._replay_forward(
+            # The drafter's aux hidden state layers are all inside the replay
+            # range (checked in _decoder_replay_supported), so the prefix
+            # layers capture none and the replay returns all of them.
+            hidden_states, pre_mix, *aux_hidden_states = self._replay_forward(
                 hidden_states,
                 positions,
                 input_ids,
@@ -1037,11 +1033,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_by_layer,
                 full_num_tokens,
             )
-        aux_hidden_states = [
-            aux_hidden_by_layer[layer_id]
-            for layer_id in self.aux_hidden_state_layers
-            if layer_id in aux_hidden_by_layer
-        ] + late_aux
+            aux_hidden_states = [
+                aux_hidden_by_layer[layer_id]
+                for layer_id in self.aux_hidden_state_layers
+                if layer_id in aux_hidden_by_layer
+            ]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1297,6 +1293,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         _scatter_replay_outputs(replay_outputs, outputs, batch.inv_rows)
         return outputs
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers and self.decoder_replay_start < self.end_layer:
+            # Decoder replay only produces aux hidden states for layers in
+            # the replay range; _decoder_replay_supported rejects drafter
+            # configs needing earlier ones.
+            assert min(layers) >= self.decoder_replay_start, (
+                "Decoder SWA bounded replay requires the drafter's aux hidden "
+                "state layers to be past the last KV source layer "
+                f"({self.decoder_replay_start - 1}), got {layers}"
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
         """Whether this rank may trim the layers after ``cut``; warns when not."""
         parallel_config = vllm_config.parallel_config
@@ -1331,10 +1339,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 f"the drafter (sliding window {draft_window}) reads hidden states "
                 f"outside the target's {window}-token window"
             )
+        elif (aux_layers := self._drafter_aux_layers(spec_config)) is not None and (
+            min(aux_layers) <= cut
+        ):
+            reason = (
+                "the drafter reads aux hidden states captured at or before the "
+                "last KV source layer"
+            )
         else:
             return True
         logger.warning_once("Decoder SWA bounded replay is off: %s.", reason)
         return False
+
+    def _drafter_aux_layers(
+        self, spec_config: SpeculativeConfig | None
+    ) -> tuple[int, ...] | None:
+        """The drafter's effective aux hidden state layers, or None when the
+        spec method reads no aux hidden states.
+
+        Mirrors the runner's setup (``set_eagle3_aux_hidden_state_layers``,
+        whose aux-using method list this method's list must stay in sync with):
+        the layers come from the draft config, else the EAGLE3 default.
+        """
+        if spec_config is None or spec_config.method not in (
+            "eagle3",
+            "dflash",
+            "dspark",
+            "extract_hidden_states",
+        ):
+            return None
+        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+            get_eagle3_aux_layers_from_config,
+        )
+
+        aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+        if aux_layers:
+            return aux_layers
+        num_layers = self.config.num_hidden_layers
+        return (2, num_layers // 2, num_layers - 3)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
