@@ -61,7 +61,9 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MoE as DeepseekV4MoEBase,
 )
 from vllm.models.deepseek_v4.nvidia.model import (
+    MegaGateRoutingMetadata,
     make_deepseek_v4_expert_params_mapping,
+    prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
@@ -340,6 +342,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_mask: torch.Tensor | None = None,
         *,
         capture_previous_aux: bool = False,
+        mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -463,7 +466,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
         )
-        x = self.ffn(x, input_ids)
+        x = self.ffn(x, input_ids, mega_gate_metadata)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
 
@@ -724,6 +727,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 
+        mega_gate_metadata = None
+        if self.use_mega_moe:
+            mega_gate_metadata = prepare_mega_gate_routing_metadata(
+                input_ids,
+                has_hash_routing=False,
+                image_sentinel_base_id=IMAGE_SENTINEL_BASE_ID
+                if getattr(self.config, "vision_n_layers", 0) > 0
+                else None,
+            )
+
         residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
         if not get_pp_group().is_first_rank:
@@ -742,6 +755,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer,
             engram_hashes,
             engram_mask,
+            mega_gate_metadata,
         )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
@@ -753,6 +767,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 post_mix,
                 res_mix,
                 residual,
+                mega_gate_metadata=mega_gate_metadata,
             )
         else:
             hidden_states = self._collapse(
@@ -809,6 +824,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         aux_hidden_by_layer: dict[int, torch.Tensor],
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
@@ -826,6 +842,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     engram_hashes,
                     engram_mask,
                     capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    mega_gate_metadata=mega_gate_metadata,
                 )
             )
             if previous_aux is not None:
@@ -862,6 +879,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         post_mix: torch.Tensor,
         res_mix: torch.Tensor,
         residual: torch.Tensor,
+        mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers past the last KV source, on whatever rows they are given."""
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
@@ -875,6 +893,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             res_mix,
             residual,
             aux_hidden_by_layer,
+            mega_gate_metadata=mega_gate_metadata,
         )
         hidden_states = self._collapse(
             hidden_states,

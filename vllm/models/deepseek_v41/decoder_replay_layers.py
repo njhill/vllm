@@ -38,6 +38,14 @@ from vllm.utils.torch_utils import weak_ref_tensor
 States = tuple[torch.Tensor | None, ...]
 
 
+def _map_token_metadata(meta: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
+    """Map ``fn`` over the per-token tensor fields of a routing-metadata
+    NamedTuple (``MegaGateRoutingMetadata``), keeping None fields."""
+    if meta is None:
+        return None
+    return type(meta)(*(None if t is None else fn(t) for t in meta))
+
+
 @dataclass
 class ReplayBatch:
     """The rows the replay layers run on, and what their forward context
@@ -71,23 +79,31 @@ class ReplayCudaGraphs:
         self.wrapper = BreakableCUDAGraphWrapper(run_layers, vllm_config)
         self._inputs: list[torch.Tensor | None] | None = None
         self._outputs: list[torch.Tensor] | None = None
+        self._mega_inputs: list[torch.Tensor | None] | None = None
 
     @property
     def allocated(self) -> bool:
         return self._outputs is not None
 
-    def allocate(self, states: States, outputs: tuple[torch.Tensor, ...]) -> None:
+    def allocate(
+        self, states: States, outputs: tuple[torch.Tensor, ...], mega: Any = None
+    ) -> None:
         size = self.max_size
         self._inputs = [
             None if t is None else t.new_zeros((size, *t.shape[1:])) for t in states
         ]
         self._outputs = [out.new_zeros((size, *out.shape[1:])) for out in outputs]
+        self._mega_inputs = _map_token_metadata(
+            mega, lambda t: t.new_zeros((size, *t.shape[1:]))
+        )
 
     def outputs(self, num_tokens: int) -> tuple[torch.Tensor, ...]:
         assert self._outputs is not None
         return tuple(out[:num_tokens] for out in self._outputs)
 
-    def run(self, batch: ReplayBatch, states: States) -> tuple[torch.Tensor, ...]:
+    def run(
+        self, batch: ReplayBatch, states: States, mega: Any = None
+    ) -> tuple[torch.Tensor, ...]:
         """Run under the replay's forward context, whose batch descriptor is the
         graph's size."""
         assert self._inputs is not None
@@ -104,7 +120,16 @@ class ReplayCudaGraphs:
             if buf is not None:
                 torch.index_select(t, 0, batch.rows, out=buf[:num_tokens])
         inputs = [None if buf is None else buf[:size] for buf in self._inputs]
-        outputs = self.wrapper(*inputs)
+        kwargs: dict[str, Any] = {}
+        if mega is not None:
+            assert self._mega_inputs is not None
+            for buf, t in zip(self._mega_inputs, mega):
+                if buf is not None:
+                    torch.index_select(t, 0, batch.rows, out=buf[:num_tokens])
+            kwargs["mega_gate_metadata"] = type(mega)(
+                *(None if buf is None else buf[:size] for buf in self._mega_inputs)
+            )
+        outputs = self.wrapper(*inputs, **kwargs)
         return tuple(out[:num_tokens] for out in outputs)
 
 
@@ -147,7 +172,9 @@ class DecoderReplayLayers:
                 run_layers, vllm_config, max(compilation_config.cudagraph_capture_sizes)
             )
 
-    def __call__(self, *states: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+    def __call__(
+        self, *states: torch.Tensor | None, mega_gate_metadata: Any = None
+    ) -> tuple[torch.Tensor, ...]:
         hidden_states = states[0]
         assert hidden_states is not None
 
@@ -160,7 +187,8 @@ class DecoderReplayLayers:
             weak_states = tuple(
                 None if t is None else weak_ref_tensor(t) for t in states
             )
-            outer.add_eager(lambda: self._run(weak_states, outputs))
+            weak_mega = _map_token_metadata(mega_gate_metadata, weak_ref_tensor)
+            outer.add_eager(lambda: self._run(weak_states, outputs, weak_mega))
             return outputs
 
         batch = self.replay_batch
@@ -169,15 +197,18 @@ class DecoderReplayLayers:
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
         ):
             # No replay this forward, or the eager warmup of a graph capture.
-            outputs = self.run_layers(*states)
+            outputs = self.run_layers(*states, mega_gate_metadata=mega_gate_metadata)
         else:
-            outputs = self._run(states)
+            outputs = self._run(states, mega_gate_metadata=mega_gate_metadata)
         if self.graphs is not None and not self.graphs.allocated:
-            self.graphs.allocate(states, outputs)
+            self.graphs.allocate(states, outputs, mega_gate_metadata)
         return outputs
 
     def _run(
-        self, states: States, outputs: tuple[torch.Tensor, ...] | None = None
+        self,
+        states: States,
+        outputs: tuple[torch.Tensor, ...] | None = None,
+        mega_gate_metadata: Any = None,
     ) -> tuple[torch.Tensor, ...]:
         """Run the replay layers on the replay batch and scatter the results to
         full-batch rows, into ``outputs`` when given."""
@@ -208,11 +239,15 @@ class DecoderReplayLayers:
                     *(
                         None if t is None else t.index_select(0, batch.rows)
                         for t in states
-                    )
+                    ),
+                    mega_gate_metadata=_map_token_metadata(
+                        mega_gate_metadata,
+                        lambda t: t.index_select(0, batch.rows),
+                    ),
                 )
             else:
                 assert self.graphs is not None
-                replay_outputs = self.graphs.run(batch, states)
+                replay_outputs = self.graphs.run(batch, states, mega_gate_metadata)
 
         if outputs is None:
             if not batch.trims:
