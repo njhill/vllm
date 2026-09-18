@@ -298,8 +298,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.token_lookback_depth
 
     @property
-    def decoder_replay_layers(self):
-        return self.language_model.decoder_replay_layers
+    def decoder_replay_model(self):
+        return self.language_model.decoder_replay_model
 
     def forward(
         self,

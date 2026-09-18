@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DecoderReplayLayers runs the replay layers on the forward's replay batch."""
+"""DeepseekV4Model._replay_forward/_replay_run run the replay layers on the
+forward's replay batch."""
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -11,15 +11,11 @@ import torch
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import (
-    BatchDescriptor,
     ForwardContext,
     get_forward_context,
     override_forward_context,
 )
-from vllm.models.deepseek_v41.decoder_replay_layers import (
-    DecoderReplayLayers,
-    ReplayBatch,
-)
+from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model, ReplayBatch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -31,14 +27,25 @@ WINDOW = 128
 REPLAY_ROWS = [0, *range(301 - WINDOW, 301), *range(301, 401)]
 
 
-def _replay_layers(run_layers, topk_buffer=None, candidate_buffer=None, graphs=False):
-    cfg = MagicMock()
-    cfg.parallel_config.data_parallel_size = 1
-    cfg.compilation_config.cudagraph_capture_sizes = [GRAPH_SIZE] if graphs else None
-    source_attn = SimpleNamespace(
-        topk_indices_buffer=topk_buffer, candidate_block_buffer=candidate_buffer
+def _replay_model(run_layers, topk_buffer=None, candidate_buffer=None, graphs=False):
+    """DeepseekV4Model's replay forward, bound to just the state it uses.
+
+    graphs: size static output buffers so the model graph's post-break
+    segments can read them (breakable piecewise capture).
+    """
+    model = SimpleNamespace(
+        replay_batch=None,
+        _replay_row_buffers=[
+            buf for buf in (topk_buffer, candidate_buffer) if buf is not None
+        ],
+        _replay_static_outputs=graphs,
+        _replay_max_output_rows=GRAPH_SIZE,
+        _replay_outputs=None,
     )
-    return DecoderReplayLayers(cfg, WINDOW, source_attn, run_layers)
+    model._run_decoder_replay_layers = run_layers
+    model._replay_forward = MethodType(DeepseekV4Model._replay_forward, model)
+    model._replay_run = MethodType(DeepseekV4Model._replay_run, model)
+    return model
 
 
 def _context(metadata, cudagraph_mode=CUDAGraphMode.NONE):
@@ -51,12 +58,11 @@ def _context(metadata, cudagraph_mode=CUDAGraphMode.NONE):
     )
 
 
-def _replay_batch(rows, metadata, graph_size=None, trims=True):
+def _replay_batch(rows, metadata, trims=True):
     rows = torch.tensor(rows, device=DEVICE)
     return ReplayBatch(
         rows=rows,
         trims=trims,
-        graph_size=graph_size,
         attn_metadata=metadata,
         slot_mapping={},
         is_padding=torch.zeros(len(rows), dtype=torch.bool, device=DEVICE),
@@ -70,27 +76,28 @@ def test_run_gathers_states_and_realigns_shared_indexer_buffers():
     topk_before, candidates_before = topk.clone(), candidates.clone()
     seen = {}
 
-    def run_layers(hidden_states, *rest):
+    def run_layers(hidden_states, *rest, **kwargs):
         seen["hidden_states"] = hidden_states.clone()
         replay_context = get_forward_context()
         seen["attn_metadata"] = replay_context.attn_metadata
         seen["batch_descriptor"] = replay_context.batch_descriptor
         return (hidden_states, rest[2])  # pre_mix
 
-    layers = _replay_layers(run_layers, topk, candidates)
+    model = _replay_model(run_layers, topk, candidates)
     hidden = torch.arange(NUM_TOKENS, device=DEVICE, dtype=torch.float32)[:, None]
     states = (hidden, hidden.long(), None, hidden, hidden, hidden, hidden)
     full, replay = object(), object()
-    layers.replay_batch = _replay_batch(REPLAY_ROWS, replay)
+    model.replay_batch = _replay_batch(REPLAY_ROWS, replay)
     context = _context(full)
     with override_forward_context(context):
-        outputs = layers(*states)
+        outputs = model._replay_forward(*states, None)
         assert get_forward_context() is context
 
     rows = torch.tensor(REPLAY_ROWS, device=DEVICE)
     assert torch.equal(seen["hidden_states"], hidden[rows])
     assert seen["attn_metadata"] is replay
-    assert seen["batch_descriptor"].num_tokens == len(REPLAY_ROWS)
+    # The replay runs eagerly, so the batch descriptor dispatch is the batch's.
+    assert seen["batch_descriptor"] is None
     assert torch.equal(topk[: len(REPLAY_ROWS)], topk_before[rows])
     assert torch.equal(candidates[: len(REPLAY_ROWS)], candidates_before[rows])
     assert outputs[0].shape[0] == NUM_TOKENS
@@ -101,21 +108,16 @@ def test_run_gathers_states_and_realigns_shared_indexer_buffers():
 def test_no_replay_batch_runs_the_whole_batch():
     seen = {}
 
-    def run_layers(hidden_states, *rest):
+    def run_layers(hidden_states, *rest, **kwargs):
         seen["attn_metadata"] = get_forward_context().attn_metadata
         return (hidden_states, rest[2])
 
-    layers = _replay_layers(run_layers)
+    model = _replay_model(run_layers)
     hidden = torch.zeros(NUM_TOKENS, 1, device=DEVICE)
     states = (hidden, hidden.long(), None, hidden, hidden, hidden, hidden)
     full = object()
     with override_forward_context(_context(full)):
-        outputs = layers(*states)
-    assert outputs[0] is hidden and seen["attn_metadata"] is full
-    # A graph capture's eager warmup carries the capture's replay batch.
-    layers.replay_batch = _replay_batch(REPLAY_ROWS, object(), graph_size=GRAPH_SIZE)
-    with override_forward_context(_context(full)):
-        outputs = layers(*states)
+        outputs = model._replay_forward(*states, None)
     assert outputs[0] is hidden and seen["attn_metadata"] is full
 
 
@@ -138,24 +140,18 @@ class _Metadata:
 
 
 def _fake_attention(x: torch.Tensor, out: torch.Tensor) -> None:
-    """Reads the current metadata through an eager graph break, like the real
-    attention kernels."""
-
-    def run() -> None:
-        md = get_forward_context().attn_metadata
-        n = md.num_tokens
-        out[:n] = x[:n] + md.token_to_req_indices[:n].to(x.dtype)[:, None]
-
-    capture = BreakableCUDAGraphCapture.current()
-    if capture is not None and capture.capturing:
-        capture.add_eager(run)
-    else:
-        run()
+    """Reads the current metadata eagerly, like the real attention kernels
+    running in the model graph's replay break."""
+    md = get_forward_context().attn_metadata
+    n = md.num_tokens
+    out[:n] = x[:n] + md.token_to_req_indices[:n].to(x.dtype)[:, None]
 
 
-def _fake_replay_layers(hidden, positions, _, pre_mix, post_mix, res_mix, residual):
-    # Like the window KV insert, this captured op takes the metadata's slot
-    # mapping by address.
+def _fake_replay_layers(
+    hidden, positions, _, pre_mix, post_mix, res_mix, residual, *args, **kwargs
+):
+    # Like the window KV insert, this op takes the metadata's slot mapping by
+    # address.
     slots = get_forward_context().attn_metadata.slot_mapping
     x = hidden * 2 + slots[: hidden.shape[0], None].to(hidden.dtype)
     out = torch.empty_like(x)
@@ -177,16 +173,17 @@ def _states(seed: int):
     )
 
 
-def test_replay_graph_matches_eager(monkeypatch):
-    """The replay graph captured with the model graph matches the eager path on
-    a batch it never saw, from the model graph's replay and from an eager
-    model forward."""
+def test_replay_break_matches_eager():
+    """The replay runs as an eager break of the model graph: captured with a
+    whole (untrimmed) batch, a replay with a trimming batch runs the replay
+    layers eagerly on the replay rows and writes the static output buffers the
+    graph's post-break segments read. Matches the eager path on the same
+    batch."""
     from vllm.platforms import current_platform
     from vllm.utils.torch_utils import _current_stream_tls
 
-    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
-    eager = _replay_layers(_fake_replay_layers)
-    graphed = _replay_layers(_fake_replay_layers, graphs=True)
+    eager = _replay_model(_fake_replay_layers)
+    graphed = _replay_model(_fake_replay_layers, graphs=True)
     metadata = _Metadata()
     states = _states(0)
     all_rows = list(range(NUM_TOKENS))
@@ -196,32 +193,29 @@ def test_replay_graph_matches_eager(monkeypatch):
     try:
         with torch.cuda.stream(stream):
             with override_forward_context(_context(metadata.fill(all_rows))):
-                graphed(*states)  # the profile run sizes the fixed buffers
-            graphed.replay_batch = _replay_batch(
-                all_rows, metadata, GRAPH_SIZE, trims=False
-            )
-            with override_forward_context(_context(None, CUDAGraphMode.PIECEWISE)):
+                graphed._replay_forward(*states, None)  # sizes the static buffers
+            with override_forward_context(
+                _context(metadata.fill(all_rows), CUDAGraphMode.PIECEWISE)
+            ):
                 outer = BreakableCUDAGraphCapture(
                     current_platform.get_global_graph_pool()
                 )
                 with outer:
-                    hidden_out, pre_mix_out = graphed(*states)
-            assert set(graphed.graphs.wrapper.entries) == {
-                BatchDescriptor(num_tokens=GRAPH_SIZE)
-            }
+                    hidden_out, pre_mix_out = graphed._replay_forward(*states, None)
+            assert outer.num_eager_breaks == 1
             for dst, src in zip(states, _states(1)):
                 if dst is not None:
                     dst.copy_(src)
             graphed.replay_batch = _replay_batch(
-                REPLAY_ROWS, metadata.fill(REPLAY_ROWS), GRAPH_SIZE
+                REPLAY_ROWS, metadata.fill(REPLAY_ROWS)
             )
             with override_forward_context(_context(None, CUDAGraphMode.PIECEWISE)):
                 outer.replay()
                 torch.accelerator.synchronize()
-                outputs = graphed(*states)
+                outputs = graphed._replay_forward(*states, None)
             eager.replay_batch = _replay_batch(REPLAY_ROWS, metadata.fill(REPLAY_ROWS))
             with override_forward_context(_context(None)):
-                expected = eager(*states)
+                expected = eager._replay_forward(*states, None)
     finally:
         torch.cuda.current_stream().wait_stream(stream)
         _current_stream_tls.value = prev_stream

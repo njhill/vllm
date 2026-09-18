@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, replace
 from itertools import islice
 
 import regex as re
@@ -9,6 +10,10 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -17,7 +22,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import (
+    DPMetadata,
+    get_forward_context,
+    is_forward_context_available,
+    override_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
@@ -66,7 +76,6 @@ from vllm.models.deepseek_v4.nvidia.model import (
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
-from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
 )
@@ -78,6 +87,7 @@ from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import weak_ref_tensor
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -470,6 +480,77 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
 
+@dataclass
+class ReplayBatch:
+    """The rows the decoder replay layers run on, and what their forward
+    context replaces in the batch's. Built per step by the model state
+    (``DeepseekV41ModelState``); None when the layers run on the whole batch."""
+
+    rows: torch.Tensor  # [num_tokens] rows of the full batch, in batch order
+    trims: bool  # whether any DP rank cut a request down to its window
+    attn_metadata: dict[str, typing.Any]
+    slot_mapping: dict[str, torch.Tensor]
+    is_padding: torch.Tensor
+    dp_metadata: DPMetadata | None
+
+
+def _map_mega_gate_metadata(
+    meta: MegaGateRoutingMetadata | None,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+) -> MegaGateRoutingMetadata | None:
+    """Map ``fn`` over the per-token tensor fields of the gate routing
+    metadata, keeping None fields."""
+    if meta is None:
+        return None
+    return type(meta)(*(None if t is None else fn(t) for t in meta))
+
+
+# The replay layers' inputs: hidden_states, positions, input_ids, pre_mix,
+# post_mix, res_mix, residual. Only input_ids can be absent (non-first PP
+# ranks): the prefix layers have run by the replay boundary.
+ReplayStates = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
+def _map_optional(
+    t: torch.Tensor | None, fn: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor | None:
+    return None if t is None else fn(t)
+
+
+def _weak_ref_states(states: ReplayStates) -> ReplayStates:
+    """Non-owning aliases the model graph's eager break records; the graph
+    owns the memory and recomputes it in place before the break replays."""
+    return (
+        weak_ref_tensor(states[0]),
+        weak_ref_tensor(states[1]),
+        _map_optional(states[2], weak_ref_tensor),
+        weak_ref_tensor(states[3]),
+        weak_ref_tensor(states[4]),
+        weak_ref_tensor(states[5]),
+        weak_ref_tensor(states[6]),
+    )
+
+
+def _gather_state_rows(states: ReplayStates, rows: torch.Tensor) -> ReplayStates:
+    return (
+        states[0].index_select(0, rows),
+        states[1].index_select(0, rows),
+        _map_optional(states[2], lambda t: t.index_select(0, rows)),
+        states[3].index_select(0, rows),
+        states[4].index_select(0, rows),
+        states[5].index_select(0, rows),
+        states[6].index_select(0, rows),
+    )
+
+
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -547,9 +628,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         # Decoder-side SWA bounded replay: layers past the last KV source
-        # prefill only each request's trailing window.
-        self.decoder_replay_layers: DecoderReplayLayers | None = None
+        # prefill only each request's trailing window (see _replay_forward).
         self.decoder_replay_start = self.end_layer
+        self.decoder_replay_window: int | None = None
+        # Set by the model state for every forward that trims a request down
+        # to its window (on any DP rank); None when the replay layers run on
+        # the whole batch with the batch's own attention metadata.
+        self.replay_batch: ReplayBatch | None = None
+        self._replay_row_buffers: list[torch.Tensor] = []
+        self._replay_static_outputs = False
+        self._replay_max_output_rows = 0
+        self._replay_outputs: list[torch.Tensor] | None = None
         cut = max(config.kv_source_layer_ids)
         if (
             cut < self.end_layer - 1
@@ -557,12 +646,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
             self.decoder_replay_start = cut + 1
-            self.decoder_replay_layers = DecoderReplayLayers(
-                vllm_config,
-                config.sliding_window,
-                self.layers[cut].attn,
-                self._run_decoder_replay_layers,
+            self.decoder_replay_window = config.sliding_window
+            # Per-row indexer outputs the source publishes for the layers
+            # after it.
+            source_attn = self.layers[cut].attn
+            self._replay_row_buffers = [
+                buf
+                for buf in (
+                    source_attn.topk_indices_buffer,
+                    source_attn.candidate_block_buffer,
+                )
+                if buf is not None
+            ]
+            # Under breakable piecewise graphs the replay runs as an eager
+            # break of the model graph; the graph's post-break segments read
+            # the replay's outputs at fixed addresses: static buffers, sized
+            # on the first (eager) forward to the largest capture.
+            compilation_config = vllm_config.compilation_config
+            capture_sizes = compilation_config.cudagraph_capture_sizes
+            self._replay_static_outputs = (
+                compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+                and is_breakable_cudagraph_enabled()
+                and bool(capture_sizes)
             )
+            self._replay_max_output_rows = max(capture_sizes) if capture_sizes else 0
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
@@ -758,8 +865,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             mega_gate_metadata,
         )
         late_aux: list[torch.Tensor] = []
-        if self.decoder_replay_layers is not None:
-            hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
+        if self.decoder_replay_start < self.end_layer:
+            hidden_states, pre_mix, *late_aux = self._replay_forward(
                 hidden_states,
                 positions,
                 input_ids,
@@ -767,7 +874,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 post_mix,
                 res_mix,
                 residual,
-                mega_gate_metadata=mega_gate_metadata,
+                mega_gate_metadata,
             )
         else:
             hidden_states = self._collapse(
@@ -912,6 +1019,118 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if layer_id in aux_hidden_by_layer
             ),
         )
+
+    def _replay_forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        residual: torch.Tensor,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run the layers past the last KV source: on the step's replay batch
+        when the model state trimmed requests to their trailing window, else
+        on the whole batch.
+
+        Under breakable piecewise CUDA graphs this region is an eager break of
+        the model graph: it runs eagerly at every replay, on whatever rows the
+        step's replay batch holds, and writes its outputs into fixed buffers
+        that the model graph's post-break segments read by address. Running
+        eagerly -- rather than in a graph of the replay's own -- keeps the
+        replay batch shape-dynamic: no padding to a capture size, and no
+        nested capture.
+        """
+        states: ReplayStates = (
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+        )
+        outer = BreakableCUDAGraphCapture.current()
+        if outer is not None and outer.capturing:
+            # The model graph's eager break: the segments after it read the
+            # replay's outputs at fixed addresses.
+            assert self._replay_outputs is not None
+            outputs = tuple(
+                out[: hidden_states.shape[0]] for out in self._replay_outputs
+            )
+            weak_states = _weak_ref_states(states)
+            weak_mega = _map_mega_gate_metadata(mega_gate_metadata, weak_ref_tensor)
+            outer.add_eager(lambda: self._replay_run(weak_states, weak_mega, outputs))
+            return outputs
+
+        if self.replay_batch is None:
+            outputs = self._run_decoder_replay_layers(*states, mega_gate_metadata)
+        else:
+            outputs = self._replay_run(states, mega_gate_metadata)
+        if self._replay_static_outputs and self._replay_outputs is None:
+            self._replay_outputs = [
+                out.new_zeros((self._replay_max_output_rows, *out.shape[1:]))
+                for out in outputs
+            ]
+        return outputs
+
+    def _replay_run(
+        self,
+        states: ReplayStates,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+        outputs: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run the replay layers and scatter the results to full-batch rows,
+        into ``outputs`` when given (the model graph's static buffers)."""
+        batch = self.replay_batch
+        if batch is None:
+            # A graph replay's step with nothing to trim: the whole batch,
+            # under the batch's own forward context.
+            replay_outputs = self._run_decoder_replay_layers(
+                *states, mega_gate_metadata
+            )
+            if outputs is None:
+                return replay_outputs
+            for out, t in zip(outputs, replay_outputs):
+                out.copy_(t)
+            return outputs
+        num_tokens = batch.rows.shape[0]
+
+        forward_context = get_forward_context()
+        replay_context = replace(
+            forward_context,
+            attn_metadata=batch.attn_metadata,
+            slot_mapping=batch.slot_mapping,
+            is_padding=batch.is_padding,
+            dp_metadata=batch.dp_metadata or forward_context.dp_metadata,
+        )
+        with override_forward_context(replay_context):
+            if batch.trims:
+                for buf in self._replay_row_buffers:
+                    buf[:num_tokens].copy_(buf.index_select(0, batch.rows))
+            replay_outputs = self._run_decoder_replay_layers(
+                *_gather_state_rows(states, batch.rows),
+                _map_mega_gate_metadata(
+                    mega_gate_metadata,
+                    lambda t: t.index_select(0, batch.rows),
+                ),
+            )
+
+        if outputs is None:
+            if not batch.trims:
+                return replay_outputs
+            num_batch_tokens = states[0].shape[0]
+            outputs = tuple(
+                t.new_zeros((num_batch_tokens, *t.shape[1:])) for t in replay_outputs
+            )
+        else:
+            for out in outputs:
+                out.zero_()
+        for out, t in zip(outputs, replay_outputs):
+            out.index_copy_(0, batch.rows, t)
+        return outputs
 
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
         """Whether this rank may trim the layers after ``cut``; warns when not."""
@@ -1310,8 +1529,14 @@ class DeepseekV41LLMForCausalLM(
         self.set_moe_parameters()
 
     @property
-    def decoder_replay_layers(self) -> DecoderReplayLayers | None:
-        return self.model.decoder_replay_layers
+    def decoder_replay_model(self) -> DeepseekV4Model | None:
+        """The inner text model when decoder-side SWA bounded replay is on.
+
+        The model state sets its ``replay_batch`` every step (None when the
+        replay layers run on the whole batch)."""
+        if self.model.decoder_replay_window is None:
+            return None
+        return self.model
 
     def set_moe_parameters(self) -> None:
         self.num_expert_groups = getattr(self.config, "n_group", 1)

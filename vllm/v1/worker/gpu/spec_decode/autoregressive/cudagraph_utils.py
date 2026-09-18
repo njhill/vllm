@@ -56,7 +56,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 block_tables,
                 attn_groups,
                 kv_cache_config,
-                cudagraph_mode=desc.cg_mode,
+                full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
             )
 
             return lambda cg_mode: forward_fn(

@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.models.deepseek_v41.nvidia.model_state as model_state_module
 from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
@@ -49,7 +49,11 @@ REPLAY_ROWS = [0, *range(301 - WINDOW, 301), *range(301, 401)]
 
 @pytest.fixture
 def state(monkeypatch):
-    """A DeepseekV41ModelState whose attention builds are recorded, not run."""
+    """A DeepseekV41ModelState whose attention builds are recorded, not run.
+
+    The batch's own build goes through DefaultModelState.prepare_attn (faked);
+    the replay layers' build calls build_attn_metadata directly.
+    """
     cfg = MagicMock()
     cfg.model_config.enable_prompt_embeds = False
     cfg.model_config.uses_mrope = False
@@ -58,9 +62,12 @@ def state(monkeypatch):
     cfg.scheduler_config.max_num_batched_tokens = 1024
     cfg.compilation_config.cudagraph_capture_sizes = [256, 512]
     cfg.parallel_config.data_parallel_size = 1
-    layers = SimpleNamespace(window=WINDOW, replay_batch=None)
-    model = SimpleNamespace(token_lookback_depth=0, decoder_replay_layers=layers)
+    # The model the state replays into: decoder_replay_window set, and its
+    # replay_batch attribute set per step.
+    replay_model = SimpleNamespace(decoder_replay_window=WINDOW, replay_batch=None)
+    model = SimpleNamespace(token_lookback_depth=0, decoder_replay_model=replay_model)
     builds: list = []
+    replay_builds: list = []
 
     def prepare_attn(self, input_batch, cg_mode, block_tables, slot_mappings, *a, **kw):
         builds.append(
@@ -72,9 +79,17 @@ def state(monkeypatch):
         )
         return {"swa": object()}
 
+    def record_build_attn_metadata(**kwargs):
+        replay_builds.append(SimpleNamespace(**kwargs))
+        return {"swa": object()}
+
     monkeypatch.setattr(DefaultModelState, "prepare_attn", prepare_attn)
+    monkeypatch.setattr(
+        model_state_module, "build_attn_metadata", record_build_attn_metadata
+    )
     state = DeepseekV41ModelState(cfg, model, None, DEVICE)
     state.builds = builds  # type: ignore[attr-defined]
+    state.replay_builds = replay_builds  # type: ignore[attr-defined]
     return state
 
 
@@ -117,7 +132,7 @@ def _slot_mappings(num_tokens: int) -> torch.Tensor:
     )
 
 
-def _prepare(state, batch, cg_mode):
+def _prepare(state, batch, cg_mode=CUDAGraphMode.NONE):
     """Runs prepare_attn; returns the replay batch and the replay build's inputs."""
     state.prepare_attn(
         batch,
@@ -128,25 +143,28 @@ def _prepare(state, batch, cg_mode):
         GROUPS,
     )
     replay = state.decoder_replay.replay_batch
-    return replay, (state.builds[-1] if replay is not None else None)
+    return replay, (state.replay_builds[-1] if replay is not None else None)
 
 
 def test_replay_batch_keeps_each_request_window(state):
     state._req_replay_start[2] = 50  # the encoder-side replay start of request 2
     batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
-    replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
-    assert replay is not None and replay.trims and replay.graph_size is None
+    replay, build = _prepare(state, batch)
+    assert replay is not None and replay.trims
     rows = torch.tensor(REPLAY_ROWS, device=DEVICE)
     assert torch.equal(replay.rows, rows)
-    sub = build.batch
-    assert sub.query_start_loc.tolist() == [0, 1, 129, 229]
-    assert sub.query_start_loc_np.tolist() == [0, 1, 129, 229]
-    assert sub.num_tokens == sub.num_tokens_after_padding == 229
-    assert sub.max_query_len == WINDOW
+    assert build.num_reqs == 3 and build.num_tokens == 229
+    assert build.query_start_loc_cpu.tolist() == [0, 1, 129, 229]
+    assert build.query_start_loc_gpu.tolist() == [0, 1, 129, 229]
+    assert build.max_query_len == WINDOW
     # The trimmed request's window starts at its replay window; a higher
     # encoder-side replay start stands.
-    assert build.replay_start.tolist() == [0, 300 - WINDOW, 50]
-    assert torch.equal(sub.positions, batch.positions[rows])
+    assert build.model_specific_attn_metadata.replay_start.tolist() == [
+        0,
+        300 - WINDOW,
+        50,
+    ]
+    assert torch.equal(build.positions, batch.positions[rows])
     assert torch.equal(build.slot_mappings, _slot_mappings(401)[:, rows])
     assert torch.equal(replay.slot_mapping["mla"], _slot_mappings(401)[1, rows])
     assert not replay.is_padding.any() and replay.dp_metadata is None
@@ -158,10 +176,10 @@ def test_replay_batch_keeps_device_decode_boundaries(state):
     batch = _input_batch(
         [2, 2, 300], [10, 10, 300], PREFILLING, device_query_lens=[1, 3, 300]
     )
-    replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
+    replay, build = _prepare(state, batch)
     assert replay is not None
     assert replay.rows.tolist() == [0, 1, 2, 3, *range(304 - WINDOW, 304)]
-    assert build.batch.query_start_loc.tolist() == [0, 1, 4, 4 + WINDOW]
+    assert build.query_start_loc_gpu.tolist() == [0, 1, 4, 4 + WINDOW]
 
 
 def test_prompt_logprobs_requests_keep_their_rows(state):
@@ -169,54 +187,38 @@ def test_prompt_logprobs_requests_keep_their_rows(state):
     trims; the other prefills still do."""
     state._req_keeps_rows[1] = True
     batch = _input_batch([1, 300, 300], [500, 300, 300], PREFILLING)
-    replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
+    replay, build = _prepare(state, batch)
     assert replay is not None and replay.trims
     assert replay.rows.tolist() == [0, *range(1, 301), *range(601 - WINDOW, 601)]
-    assert build.batch.max_query_len == 300
+    assert build.max_query_len == 300
 
 
 def test_replay_batch_keeps_adaptive_verification_query_bound(state):
     """Adaptive verification bounds the decodes' device-side query lengths
     above their CPU lengths; the replay batch keeps that bound."""
     batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING, max_query_len=200)
-    replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
-    assert replay is not None and build.batch.max_query_len == 200
-
-
-def test_whole_batch_forwards_get_no_replay_batch(state):
-    short = _input_batch([100, 100], [100, 100], [True, True])
-    assert _prepare(state, short, CUDAGraphMode.NONE) == (None, None)
-    assert _prepare(state, short, CUDAGraphMode.FULL) == (None, None)
-    assert len(state.builds) == 2  # the batch's own metadata only
+    replay, build = _prepare(state, batch)
+    assert replay is not None and build.max_query_len == 200
 
 
 @pytest.mark.parametrize(
-    ("prefilling", "graph_size", "num_tokens"),
-    [
-        (PREFILLING, 256, 229),  # the smallest graph fitting the trimmed rows
-        ([False] * 3, 512, 401),  # a dummy (capture) batch keeps its rows
-    ],
+    "cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE]
 )
-def test_replay_graph_size(state, prefilling, graph_size, num_tokens):
-    batch = _input_batch(QUERY_LENS, SEQ_LENS, prefilling, num_tokens_after_padding=512)
-    replay, build = _prepare(state, batch, CUDAGraphMode.PIECEWISE)
-    assert replay is not None
-    assert replay.graph_size == graph_size and replay.rows.shape[0] == num_tokens
-    assert replay.trims == (num_tokens < 401)
-    assert build.batch.num_tokens_after_padding == graph_size
-    assert (
-        replay.is_padding[num_tokens:].all()
-        and not replay.is_padding[:num_tokens].any()
-    )
-    assert (build.slot_mappings[:, num_tokens:] == PAD_SLOT_ID).all()
+def test_whole_batch_forwards_get_no_replay_batch(state, cg_mode):
+    """Nothing trims (short prefills, a dummy/capture batch, a FULL-graph
+    batch): the replay layers run on the whole batch, whatever the mode."""
+    short = _input_batch([100, 100], [100, 100], [True, True])
+    assert _prepare(state, short, cg_mode) == (None, None)
+    dummy = _input_batch([512], [512], [False], num_tokens_after_padding=512)
+    assert _prepare(state, dummy, cg_mode) == (None, None)
+    assert len(state.builds) == 2  # the batch's own metadata only
+    assert not state.replay_builds
 
 
 @pytest.fixture
 def dp_state(state, monkeypatch):
     """`state` on DP rank 0 of 2; `state.other` sets what rank 1 reports
     (trims, replay tokens)."""
-    import vllm.models.deepseek_v41.nvidia.model_state as module
-
     state.vllm_config.parallel_config.data_parallel_size = 2
     state.vllm_config.parallel_config.data_parallel_rank = 0
     state.vllm_config.parallel_config.is_moe_model = True
@@ -225,35 +227,39 @@ def dp_state(state, monkeypatch):
     def all_reduce(tensor, group):
         tensor[1] = torch.tensor(state.other, dtype=torch.int32)
 
-    monkeypatch.setattr(module.dist, "all_reduce", all_reduce)
-    monkeypatch.setattr(module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
+    monkeypatch.setattr(model_state_module.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        model_state_module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
     return state
 
 
-def test_dp_ranks_replay_together(dp_state):
-    """With no rank trimming a piecewise forward replays the padded batch on
-    every rank; a trimming rank makes the others replay too, on their counts."""
+@pytest.mark.parametrize(
+    "cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE]
+)
+def test_dp_ranks_replay_together(dp_state, cg_mode):
+    """The replay layers' MoE collectives need every rank in the replay
+    together: no rank trimming means no replay on any rank and in any mode;
+    a trimming rank makes the others replay too, on their own counts."""
     short = _input_batch(
         [100, 100], [100, 100], [True, True], num_tokens_after_padding=512
     )
     dp_state.other = (False, 200)
-    assert _prepare(dp_state, short, CUDAGraphMode.NONE) == (None, None)
-    replay, _ = _prepare(dp_state, short, CUDAGraphMode.PIECEWISE)
-    assert replay is not None and not replay.trims and replay.graph_size == 512
-    assert replay.dp_metadata.num_tokens_across_dp_cpu.tolist() == [512, 512]
+    assert _prepare(dp_state, short, cg_mode) == (None, None)
 
     dp_state.other = (True, 300)  # rank 1 trims to 300 rows
-    replay, _ = _prepare(dp_state, short, CUDAGraphMode.NONE)
-    assert replay is not None and replay.graph_size is None
+    replay, _ = _prepare(dp_state, short, cg_mode)
+    assert replay is not None and replay.trims
+    # This rank keeps its 200 rows (nothing to trim) and replays on the
+    # agreed counts: its own 200 and rank 1's 300.
+    assert replay.rows.shape[0] == 200
     assert replay.dp_metadata.num_tokens_across_dp_cpu.tolist() == [200, 300]
-    replay, _ = _prepare(dp_state, short, CUDAGraphMode.PIECEWISE)
-    assert replay.graph_size == 512  # 256 would fit this rank's 200 rows alone
-    assert replay.dp_metadata.num_tokens_across_dp_cpu.tolist() == [512, 512]
 
 
-def test_idle_dp_rank_dummy_trims_to_the_agreed_size(dp_state):
+def test_idle_dp_rank_dummy_trims_to_the_agreed_replay(dp_state):
     dummy = _input_batch([512], [512], [False])
     dp_state.other = (True, 129)
     replay, _ = _prepare(dp_state, dummy, CUDAGraphMode.PIECEWISE)
     assert replay is not None and replay.trims
-    assert replay.rows.shape[0] == WINDOW and replay.graph_size == 256
+    assert replay.rows.shape[0] == WINDOW
+    assert replay.dp_metadata.num_tokens_across_dp_cpu.tolist() == [WINDOW, 129]
