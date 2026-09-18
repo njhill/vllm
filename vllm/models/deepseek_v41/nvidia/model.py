@@ -86,6 +86,7 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import weak_ref_tensor
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -487,22 +488,15 @@ class ReplayBatch:
     (``DeepseekV41ModelState``); None when the layers run on the whole batch."""
 
     rows: torch.Tensor  # [num_tokens] rows of the full batch, in batch order
+    # [num_batch_tokens] int32: the replay row each full-batch row maps to,
+    # -1 for dropped rows (padding rows hold stale values; readers mask on
+    # ``< num_tokens``).
+    inv_rows: torch.Tensor
     trims: bool  # whether any DP rank cut a request down to its window
     attn_metadata: dict[str, typing.Any]
     slot_mapping: dict[str, torch.Tensor]
     is_padding: torch.Tensor
     dp_metadata: DPMetadata | None
-
-
-def _map_mega_gate_metadata(
-    meta: MegaGateRoutingMetadata | None,
-    fn: Callable[[torch.Tensor], torch.Tensor],
-) -> MegaGateRoutingMetadata | None:
-    """Map ``fn`` over the per-token tensor fields of the gate routing
-    metadata, keeping None fields."""
-    if meta is None:
-        return None
-    return type(meta)(*(None if t is None else fn(t) for t in meta))
 
 
 # The replay layers' inputs: hidden_states, positions, input_ids, pre_mix,
@@ -539,16 +533,182 @@ def _weak_ref_states(states: ReplayStates) -> ReplayStates:
     )
 
 
-def _gather_state_rows(states: ReplayStates, rows: torch.Tensor) -> ReplayStates:
+@triton.jit
+def _copy_row(src_ptr, dst_ptr, src_row, dst_row, width, keep, BLOCK: tl.constexpr):
+    """Copy row ``src_row`` of a row-major tensor to row ``dst_row`` of
+    another, writing zeros when not ``keep``. Width 0 marks an absent slot."""
+    for off in range(0, width, BLOCK):
+        cols = off + tl.arange(0, BLOCK)
+        mask = cols < width
+        val = tl.load(src_ptr + src_row * width + cols, mask=mask & keep, other=0)
+        tl.store(dst_ptr + dst_row * width + cols, val, mask=mask)
+
+
+@triton.jit
+def _replay_gather_kernel(
+    rows_ptr,  # [num_rows] int64: the full-batch row of every replay row
+    # (src, dst, width) per slot, states contiguous along the trailing dims;
+    # width 0 marks an absent slot (no input_ids on non-first PP ranks, no
+    # indexer buffers to realign when nothing trims).
+    src0_ptr,
+    dst0_ptr,
+    w0,  # hidden_states
+    src1_ptr,
+    dst1_ptr,
+    w1,  # positions
+    src2_ptr,
+    dst2_ptr,
+    w2,  # input_ids
+    src3_ptr,
+    dst3_ptr,
+    w3,  # pre_mix
+    src4_ptr,
+    dst4_ptr,
+    w4,  # post_mix
+    src5_ptr,
+    dst5_ptr,
+    w5,  # res_mix
+    src6_ptr,
+    dst6_ptr,
+    w6,  # residual
+    src7_ptr,
+    dst7_ptr,
+    w7,  # indexer topk indices, into scratch
+    src8_ptr,
+    dst8_ptr,
+    w8,  # indexer candidate blocks, into scratch
+    BLOCK: tl.constexpr,
+):
+    # One program per replay row: copy that row of every tensor. The row
+    # buffers go to scratch (see the caller): gathering them in place would
+    # race, since a kept row can sit below a later replay row.
+    j = tl.program_id(0).to(tl.int64)
+    row = tl.load(rows_ptr + j)
+    _copy_row(src0_ptr, dst0_ptr, row, j, w0, True, BLOCK)
+    _copy_row(src1_ptr, dst1_ptr, row, j, w1, True, BLOCK)
+    _copy_row(src2_ptr, dst2_ptr, row, j, w2, True, BLOCK)
+    _copy_row(src3_ptr, dst3_ptr, row, j, w3, True, BLOCK)
+    _copy_row(src4_ptr, dst4_ptr, row, j, w4, True, BLOCK)
+    _copy_row(src5_ptr, dst5_ptr, row, j, w5, True, BLOCK)
+    _copy_row(src6_ptr, dst6_ptr, row, j, w6, True, BLOCK)
+    _copy_row(src7_ptr, dst7_ptr, row, j, w7, True, BLOCK)
+    _copy_row(src8_ptr, dst8_ptr, row, j, w8, True, BLOCK)
+
+
+@triton.jit(do_not_specialize=["num_src"])
+def _replay_scatter_kernel(
+    inv_rows_ptr,  # [num_dst] int32: the src row of each dst row
+    num_src,
+    # (src, dst, width) per slot; width 0 marks an absent slot.
+    src0_ptr,
+    dst0_ptr,
+    w0,  # hidden_states
+    src1_ptr,
+    dst1_ptr,
+    w1,  # pre_mix
+    src2_ptr,
+    dst2_ptr,
+    w2,  # aux hidden states (up to 4 per launch)
+    src3_ptr,
+    dst3_ptr,
+    w3,
+    src4_ptr,
+    dst4_ptr,
+    w4,
+    src5_ptr,
+    dst5_ptr,
+    w5,
+    USE_INV: tl.constexpr,  # False: plain copy, dst row i = src row i
+    BLOCK: tl.constexpr,
+):
+    # One program per destination row.
+    i = tl.program_id(0).to(tl.int64)
+    if USE_INV:
+        idx = tl.load(inv_rows_ptr + i)
+        # Stale entries past the batch's rows must not read out of bounds.
+        keep = (idx >= 0) & (idx < num_src)
+        src_row = tl.maximum(idx, 0).to(tl.int64)
+    else:
+        keep = True
+        src_row = i
+    _copy_row(src0_ptr, dst0_ptr, src_row, i, w0, keep, BLOCK)
+    _copy_row(src1_ptr, dst1_ptr, src_row, i, w1, keep, BLOCK)
+    _copy_row(src2_ptr, dst2_ptr, src_row, i, w2, keep, BLOCK)
+    _copy_row(src3_ptr, dst3_ptr, src_row, i, w3, keep, BLOCK)
+    _copy_row(src4_ptr, dst4_ptr, src_row, i, w4, keep, BLOCK)
+    _copy_row(src5_ptr, dst5_ptr, src_row, i, w5, keep, BLOCK)
+
+
+def _gather_replay_states(
+    states: ReplayStates,
+    rows: torch.Tensor,
+    row_buffers: list[torch.Tensor],
+    row_scratches: list[torch.Tensor],
+) -> ReplayStates:
+    """Gather the replay rows of every state in one kernel launch, realigning
+    the source's indexer row buffers into scratch on the way (they are copied
+    back by the caller once the gather has finished reading them)."""
+    num_rows = rows.shape[0]
+    hidden, positions, input_ids, pre_mix, post_mix, res_mix, residual = states
+    gathered: list[torch.Tensor | None] = []
+    slots: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
+    for src in (hidden, positions, input_ids, pre_mix, post_mix, res_mix, residual):
+        dst = (
+            torch.empty((num_rows, *src.shape[1:]), dtype=src.dtype, device=src.device)
+            if src is not None
+            else None
+        )
+        gathered.append(dst)
+        slots.append((src, dst))
+    slots += list(zip(row_buffers, row_scratches))
+    assert len(slots) <= 9
+    args: list = []
+    for src, dst in slots + [(None, None)] * (9 - len(slots)):
+        if src is None or dst is None:
+            args += [rows, rows, 0]  # dummy slot, never read (width 0)
+        else:
+            assert src.is_contiguous() and dst.is_contiguous()
+            # The per-row width comes from the source: scratch destinations
+            # keep their full-size row count.
+            args += [src, dst, src.numel() // src.shape[0]]
+    _replay_gather_kernel[(num_rows,)](rows, *args, BLOCK=1024)
     return (
-        states[0].index_select(0, rows),
-        states[1].index_select(0, rows),
-        _map_optional(states[2], lambda t: t.index_select(0, rows)),
-        states[3].index_select(0, rows),
-        states[4].index_select(0, rows),
-        states[5].index_select(0, rows),
-        states[6].index_select(0, rows),
+        gathered[0],  # type: ignore[return-value]
+        gathered[1],
+        gathered[2],
+        gathered[3],
+        gathered[4],
+        gathered[5],
+        gathered[6],
     )
+
+
+def _scatter_replay_outputs(
+    srcs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    dsts: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    inv_rows: torch.Tensor | None,
+) -> None:
+    """Scatter replay outputs to their full-batch rows in one kernel launch
+    per six tensors (zeroing rows without a replay row), or copy them whole
+    when ``inv_rows`` is None."""
+    num_dst = dsts[0].shape[0]
+    num_src = srcs[0].shape[0]
+    for off in range(0, len(srcs), 6):
+        chunk = list(zip(srcs[off : off + 6], dsts[off : off + 6]))
+        args: list = []
+        for src, dst in chunk + [(None, None)] * (6 - len(chunk)):
+            if src is None or dst is None:
+                args += [dsts[0], dsts[0], 0]  # dummy slot, never read
+            else:
+                assert src.is_contiguous() and dst.is_contiguous()
+                args += [src, dst, dst.numel() // num_dst]
+        _replay_scatter_kernel[(num_dst,)](
+            inv_rows if inv_rows is not None else srcs[0],
+            num_src,
+            *args,
+            USE_INV=inv_rows is not None,
+            BLOCK=1024,
+        )
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -636,6 +796,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # the whole batch with the batch's own attention metadata.
         self.replay_batch: ReplayBatch | None = None
         self._replay_row_buffers: list[torch.Tensor] = []
+        self._replay_row_scratch: list[torch.Tensor] | None = None
         self._replay_static_outputs = False
         self._replay_max_output_rows = 0
         self._replay_outputs: list[torch.Tensor] | None = None
@@ -834,15 +995,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 
-        mega_gate_metadata = None
-        if self.use_mega_moe:
-            mega_gate_metadata = prepare_mega_gate_routing_metadata(
-                input_ids,
-                has_hash_routing=False,
-                image_sentinel_base_id=IMAGE_SENTINEL_BASE_ID
-                if getattr(self.config, "vision_n_layers", 0) > 0
-                else None,
-            )
+        mega_gate_metadata = self._mega_gate_metadata(input_ids)
 
         residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
@@ -874,7 +1027,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 post_mix,
                 res_mix,
                 residual,
-                mega_gate_metadata,
             )
         else:
             hidden_states = self._collapse(
@@ -1010,15 +1162,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer,
             positions.shape[0],
         )
-        return (
-            hidden_states,
-            pre_mix,
-            *(
-                aux_hidden_by_layer[layer_id]
-                for layer_id in self.aux_hidden_state_layers
-                if layer_id in aux_hidden_by_layer
-            ),
+        aux_hidden = (
+            aux_hidden_by_layer[layer_id]
+            for layer_id in self.aux_hidden_state_layers
+            if layer_id in aux_hidden_by_layer
         )
+        return hidden_states, pre_mix, *aux_hidden
 
     def _replay_forward(
         self,
@@ -1029,7 +1178,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         post_mix: torch.Tensor,
         res_mix: torch.Tensor,
         residual: torch.Tensor,
-        mega_gate_metadata: MegaGateRoutingMetadata | None,
     ) -> tuple[torch.Tensor, ...]:
         """Run the layers past the last KV source: on the step's replay batch
         when the model state trimmed requests to their trailing window, else
@@ -1061,14 +1209,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 out[: hidden_states.shape[0]] for out in self._replay_outputs
             )
             weak_states = _weak_ref_states(states)
-            weak_mega = _map_mega_gate_metadata(mega_gate_metadata, weak_ref_tensor)
-            outer.add_eager(lambda: self._replay_run(weak_states, weak_mega, outputs))
+            outer.add_eager(lambda: self._replay_run(weak_states, outputs))
             return outputs
 
-        if self.replay_batch is None:
-            outputs = self._run_decoder_replay_layers(*states, mega_gate_metadata)
-        else:
-            outputs = self._replay_run(states, mega_gate_metadata)
+        outputs = self._replay_run(states)
         if self._replay_static_outputs and self._replay_outputs is None:
             self._replay_outputs = [
                 out.new_zeros((self._replay_max_output_rows, *out.shape[1:]))
@@ -1076,10 +1220,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ]
         return outputs
 
+    def _mega_gate_metadata(
+        self, input_ids: torch.Tensor | None
+    ) -> MegaGateRoutingMetadata | None:
+        """The MoE gate routing metadata for a batch's (or a replay batch's)
+        input ids; None where mega MoE or the ids are absent (non-first PP
+        ranks)."""
+        if input_ids is None or not self.use_mega_moe:
+            return None
+        sentinel_id = None
+        if getattr(self.config, "vision_n_layers", 0) > 0:
+            sentinel_id = IMAGE_SENTINEL_BASE_ID
+        return prepare_mega_gate_routing_metadata(
+            input_ids, has_hash_routing=False, image_sentinel_base_id=sentinel_id
+        )
+
     def _replay_run(
         self,
         states: ReplayStates,
-        mega_gate_metadata: MegaGateRoutingMetadata | None,
         outputs: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Run the replay layers and scatter the results to full-batch rows,
@@ -1089,15 +1247,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # A graph replay's step with nothing to trim: the whole batch,
             # under the batch's own forward context.
             replay_outputs = self._run_decoder_replay_layers(
-                *states, mega_gate_metadata
+                *states, self._mega_gate_metadata(states[2])
             )
             if outputs is None:
                 return replay_outputs
-            for out, t in zip(outputs, replay_outputs):
-                out.copy_(t)
+            _scatter_replay_outputs(replay_outputs, outputs, inv_rows=None)
             return outputs
         num_tokens = batch.rows.shape[0]
 
+        # Realign the source's per-row indexer outputs to the replay rows.
+        # The gather cannot write them in place (a kept row can sit below a
+        # later replay row), so it lands in scratch and is copied back.
+        scratches: list[torch.Tensor] = []
+        if batch.trims and self._replay_row_buffers:
+            if self._replay_row_scratch is None:
+                self._replay_row_scratch = [
+                    torch.empty_like(buf) for buf in self._replay_row_buffers
+                ]
+            scratches = self._replay_row_scratch
+        gathered = _gather_replay_states(
+            states, batch.rows, self._replay_row_buffers if scratches else [], scratches
+        )
+        if scratches:
+            _scatter_replay_outputs(
+                [s[:num_tokens] for s in scratches],
+                [buf[:num_tokens] for buf in self._replay_row_buffers],
+                inv_rows=None,
+            )
         forward_context = get_forward_context()
         replay_context = replace(
             forward_context,
@@ -1107,15 +1283,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dp_metadata=batch.dp_metadata or forward_context.dp_metadata,
         )
         with override_forward_context(replay_context):
-            if batch.trims:
-                for buf in self._replay_row_buffers:
-                    buf[:num_tokens].copy_(buf.index_select(0, batch.rows))
             replay_outputs = self._run_decoder_replay_layers(
-                *_gather_state_rows(states, batch.rows),
-                _map_mega_gate_metadata(
-                    mega_gate_metadata,
-                    lambda t: t.index_select(0, batch.rows),
-                ),
+                *gathered, self._mega_gate_metadata(gathered[2])
             )
 
         if outputs is None:
@@ -1123,13 +1292,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 return replay_outputs
             num_batch_tokens = states[0].shape[0]
             outputs = tuple(
-                t.new_zeros((num_batch_tokens, *t.shape[1:])) for t in replay_outputs
+                t.new_empty((num_batch_tokens, *t.shape[1:])) for t in replay_outputs
             )
-        else:
-            for out in outputs:
-                out.zero_()
-        for out, t in zip(outputs, replay_outputs):
-            out.index_copy_(0, batch.rows, t)
+        _scatter_replay_outputs(replay_outputs, outputs, batch.inv_rows)
         return outputs
 
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:

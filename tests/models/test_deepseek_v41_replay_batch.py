@@ -167,6 +167,12 @@ def test_replay_batch_keeps_each_request_window(state):
     assert torch.equal(build.positions, batch.positions[rows])
     assert torch.equal(build.slot_mappings, _slot_mappings(401)[:, rows])
     assert torch.equal(replay.slot_mapping["mla"], _slot_mappings(401)[1, rows])
+    # The inverse map: the replay row of every kept batch row, -1 for dropped.
+    assert torch.equal(
+        replay.inv_rows[rows],
+        torch.arange(len(REPLAY_ROWS), dtype=torch.int32, device=DEVICE),
+    )
+    assert (replay.inv_rows[:401] == -1).sum() == 401 - len(REPLAY_ROWS)
     assert not replay.is_padding.any() and replay.dp_metadata is None
 
 

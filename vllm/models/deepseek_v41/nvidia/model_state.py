@@ -108,6 +108,7 @@ def _gather_replay_batch_kernel(
     slot_mappings_ptr,  # [num_groups, num_tokens_padded]
     slot_mappings_stride,
     rows_ptr,  # out: [num_tokens] batch row of every kept row
+    inv_rows_ptr,  # out: [num_batch_tokens] replay row per batch row; -1 if dropped
     replay_query_start_loc_ptr,  # out: [num_reqs + 1]
     replay_positions_ptr,  # out: [num_tokens]
     replay_is_padding_ptr,  # out: [num_tokens]
@@ -118,38 +119,42 @@ def _gather_replay_batch_kernel(
     BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
+    begin = tl.load(query_start_loc_ptr + req)
     end = tl.load(query_start_loc_ptr + req + 1)
-    kept_begin = tl.load(query_start_loc_ptr + req) - tl.load(dropped_before_ptr + req)
+    kept_begin = begin - tl.load(dropped_before_ptr + req)
     kept_end = end - tl.load(dropped_before_ptr + req + 1)
     if req == 0:
         tl.store(replay_query_start_loc_ptr, kept_begin)
     tl.store(replay_query_start_loc_ptr + req + 1, kept_end)
-    # Kept row r of the request is its window start + (r - kept_begin).
+    # Kept replay row t of the request holds batch row window_start + (t -
+    # kept_begin).
     window_start = end - (kept_end - kept_begin)
-    for tok in range(kept_begin, kept_end, BLOCK):
-        offs = tok + tl.arange(0, BLOCK)
-        mask = offs < kept_end
-        row = window_start + (offs - kept_begin)
-        tl.store(rows_ptr + offs, row.to(tl.int64), mask=mask)
+    for start in range(begin, end, BLOCK):
+        rows = start + tl.arange(0, BLOCK)
+        in_req = rows < end
+        kept = in_req & (rows >= window_start)
+        tok = kept_begin + (rows - window_start)
+        tl.store(inv_rows_ptr + rows, tl.where(kept, tok, -1), mask=in_req)
+        tl.store(rows_ptr + tok, rows.to(tl.int64), mask=kept)
         tl.store(
-            replay_positions_ptr + offs,
-            tl.load(positions_ptr + row, mask=mask, other=0),
-            mask=mask,
+            replay_positions_ptr + tok,
+            tl.load(positions_ptr + rows, mask=kept, other=0),
+            mask=kept,
         )
         tl.store(
-            replay_is_padding_ptr + offs,
-            tl.load(is_padding_ptr + row, mask=mask, other=0),
-            mask=mask,
+            replay_is_padding_ptr + tok,
+            tl.load(is_padding_ptr + rows, mask=kept, other=0),
+            mask=kept,
         )
         for g in tl.static_range(NUM_GROUPS):
             tl.store(
-                replay_slot_mappings_ptr + g * replay_slot_mappings_stride + offs,
+                replay_slot_mappings_ptr + g * replay_slot_mappings_stride + tok,
                 tl.load(
-                    slot_mappings_ptr + g * slot_mappings_stride + row,
-                    mask=mask,
+                    slot_mappings_ptr + g * slot_mappings_stride + rows,
+                    mask=kept,
                     other=pad_slot_id,
                 ),
-                mask=mask,
+                mask=kept,
             )
 
 
@@ -235,6 +240,11 @@ class DeepseekV41ModelState(DefaultModelState):
         # and the position from which each request holds replay-layer window KV.
         self._replay_rows = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        # Inverse of the rows: the replay row of every full-batch row, -1 for
+        # dropped rows. Drives the fused scatter of the replay layers' outputs.
+        self._replay_row_inv = torch.zeros(
+            self.max_num_tokens, dtype=torch.int32, device=device
         )
         self._replay_inputs = InputBuffers(
             self.max_num_reqs, self.max_num_tokens, device
@@ -451,6 +461,7 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         return ReplayBatch(
             rows=rows,
+            inv_rows=self._replay_row_inv[: input_batch.num_tokens_after_padding],
             trims=trims,
             attn_metadata=attn_metadata,
             slot_mapping=build_slot_mappings_by_layer(
@@ -518,6 +529,7 @@ class DeepseekV41ModelState(DefaultModelState):
             slot_mappings,
             slot_mappings.stride(0),
             self._replay_rows,
+            self._replay_row_inv,
             inputs.query_start_loc,
             inputs.positions,
             inputs.is_padding,

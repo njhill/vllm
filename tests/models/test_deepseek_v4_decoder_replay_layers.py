@@ -35,9 +35,11 @@ def _replay_model(run_layers, topk_buffer=None, candidate_buffer=None, graphs=Fa
     """
     model = SimpleNamespace(
         replay_batch=None,
+        use_mega_moe=False,
         _replay_row_buffers=[
             buf for buf in (topk_buffer, candidate_buffer) if buf is not None
         ],
+        _replay_row_scratch=None,
         _replay_static_outputs=graphs,
         _replay_max_output_rows=GRAPH_SIZE,
         _replay_outputs=None,
@@ -45,6 +47,7 @@ def _replay_model(run_layers, topk_buffer=None, candidate_buffer=None, graphs=Fa
     model._run_decoder_replay_layers = run_layers
     model._replay_forward = MethodType(DeepseekV4Model._replay_forward, model)
     model._replay_run = MethodType(DeepseekV4Model._replay_run, model)
+    model._mega_gate_metadata = MethodType(DeepseekV4Model._mega_gate_metadata, model)
     return model
 
 
@@ -60,8 +63,11 @@ def _context(metadata, cudagraph_mode=CUDAGraphMode.NONE):
 
 def _replay_batch(rows, metadata, trims=True):
     rows = torch.tensor(rows, device=DEVICE)
+    inv_rows = torch.full((NUM_TOKENS,), -1, dtype=torch.int32, device=DEVICE)
+    inv_rows[rows] = torch.arange(len(rows), dtype=torch.int32, device=DEVICE)
     return ReplayBatch(
         rows=rows,
+        inv_rows=inv_rows,
         trims=trims,
         attn_metadata=metadata,
         slot_mapping={},
@@ -90,7 +96,7 @@ def test_run_gathers_states_and_realigns_shared_indexer_buffers():
     model.replay_batch = _replay_batch(REPLAY_ROWS, replay)
     context = _context(full)
     with override_forward_context(context):
-        outputs = model._replay_forward(*states, None)
+        outputs = model._replay_forward(*states)
         assert get_forward_context() is context
 
     rows = torch.tensor(REPLAY_ROWS, device=DEVICE)
@@ -117,7 +123,7 @@ def test_no_replay_batch_runs_the_whole_batch():
     states = (hidden, hidden.long(), None, hidden, hidden, hidden, hidden)
     full = object()
     with override_forward_context(_context(full)):
-        outputs = model._replay_forward(*states, None)
+        outputs = model._replay_forward(*states)
     assert outputs[0] is hidden and seen["attn_metadata"] is full
 
 
@@ -193,7 +199,7 @@ def test_replay_break_matches_eager():
     try:
         with torch.cuda.stream(stream):
             with override_forward_context(_context(metadata.fill(all_rows))):
-                graphed._replay_forward(*states, None)  # sizes the static buffers
+                graphed._replay_forward(*states)  # sizes the static buffers
             with override_forward_context(
                 _context(metadata.fill(all_rows), CUDAGraphMode.PIECEWISE)
             ):
@@ -201,7 +207,7 @@ def test_replay_break_matches_eager():
                     current_platform.get_global_graph_pool()
                 )
                 with outer:
-                    hidden_out, pre_mix_out = graphed._replay_forward(*states, None)
+                    hidden_out, pre_mix_out = graphed._replay_forward(*states)
             assert outer.num_eager_breaks == 1
             for dst, src in zip(states, _states(1)):
                 if dst is not None:
@@ -212,10 +218,10 @@ def test_replay_break_matches_eager():
             with override_forward_context(_context(None, CUDAGraphMode.PIECEWISE)):
                 outer.replay()
                 torch.accelerator.synchronize()
-                outputs = graphed._replay_forward(*states, None)
+                outputs = graphed._replay_forward(*states)
             eager.replay_batch = _replay_batch(REPLAY_ROWS, metadata.fill(REPLAY_ROWS))
             with override_forward_context(_context(None)):
-                expected = eager._replay_forward(*states, None)
+                expected = eager._replay_forward(*states)
     finally:
         torch.cuda.current_stream().wait_stream(stream)
         _current_stream_tls.value = prev_stream
