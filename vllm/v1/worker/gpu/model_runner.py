@@ -174,6 +174,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    is_uniform_query_len,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -1218,7 +1219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if dummy_run:
             # Dummy batches are uniform by construction.
             return None, get_uniform_decode_token_count(
-                num_reqs, num_toks, max_query_len, has_prefill=False
+                num_reqs, num_toks, max_query_len, decode_graph_eligible=True
             )
 
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1265,6 +1266,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 & (num_computed_prefill_tokens_np > 0)
             )
 
+        decode_graph_eligible = not has_prefill
+        if prefill_runs_as_decode_np is not None:
+            decode_graph_eligible = bool(
+                (prefill_runs_as_decode_np | ~is_prefilling_np).all()
+            )
+        uniform_tok_count = None
+        if decode_graph_eligible and is_uniform_query_len(
+            num_reqs, num_toks, max_query_len
+        ):
+            uniform_tok_count = max_query_len
+
         batch_state = BatchReqState(
             req_ids=req_ids,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1274,12 +1286,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
             has_prefill=has_prefill,
+            decode_graph_eligible=decode_graph_eligible,
             num_draft_tokens_np=num_draft_tokens_np,
             prefill_runs_as_decode_np=prefill_runs_as_decode_np,
         )
-        return batch_state, get_uniform_decode_token_count(
-            num_reqs, num_toks, max_query_len, batch_state.has_prefill
-        )
+        return batch_state, uniform_tok_count
 
     def _prepare_padding_mask(
         self, num_tokens: int, num_tokens_after_padding: int
@@ -1470,6 +1481,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
+            decode_graph_eligible=batch_req_state.decode_graph_eligible,
             prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -2345,6 +2357,7 @@ class BatchReqState(NamedTuple):
     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
     is_prefilling_np: np.ndarray  # [num_reqs]
     has_prefill: bool
+    decode_graph_eligible: bool
     num_draft_tokens_np: np.ndarray | None  # [num_reqs], None if no drafts
     prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
 

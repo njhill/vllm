@@ -153,6 +153,41 @@ def test_one_new_prompt_token_over_context_runs_as_decode():
     }
 
 
+def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
+    # Replaying the last prompt token over existing context (full prefix-cache
+    # hit or P/D KV import) computes exactly like a decode.
+    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
+    assert _uniform_token_count(batch, 1) == 1
+
+    # A fresh 1-token prompt alongside it has no prior state.
+    batch["p1"] = (0, 1)
+    assert _uniform_token_count(batch, 1) is None
+
+    # Only one-token tails qualify, not K+1 chunks with prior context.
+    assert _uniform_token_count({"d0": (16, 16), "p0": (120, 129)}, 8) is None
+
+
+def test_padded_prompt_tail_with_prior_context_is_uniform_decode():
+    # The scheduler pads a one-token prompt tail with K placeholder drafts to
+    # keep the K+1 spec-decode shape; it verifies like any other decode.
+    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
+    runner = _make_runner(batch, decode_query_len=4)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={req_id: 4 for req_id in batch},
+        total_num_scheduled_tokens=12,
+        scheduled_spec_decode_tokens={req_id: [-1] * 3 for req_id in batch},
+    )
+    state, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.has_prefill and state.decode_graph_eligible
+    assert uniform_tok_count == 4
+
+    # Without the placeholder drafts, it is a real 4-token prompt chunk.
+    del scheduler_output.scheduled_spec_decode_tokens["p0"]
+    state, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, False)
+    assert not state.decode_graph_eligible
+    assert uniform_tok_count is None
+
+
 def test_dummy_batches_stay_uniform_decode():
     # Dummy batches have no request state to consult and must stay classified
     # by shape alone; rejecting them would make capture and replay disagree.
@@ -240,11 +275,11 @@ def test_uniform_decode_uses_state_index_not_batch_position():
 
 
 def test_uniform_decode_predicate():
-    # Shape and prefill state must both pass.
-    assert get_uniform_decode_token_count(2, 16, 8, False) == 8
-    assert get_uniform_decode_token_count(2, 16, 8, True) is None
+    # Shape and decode-graph eligibility must both pass.
+    assert get_uniform_decode_token_count(2, 16, 8, True) == 8
+    assert get_uniform_decode_token_count(2, 16, 8, False) is None
     # 12 tokens over 2 requests is no shared query length.
-    assert get_uniform_decode_token_count(2, 12, 8, False) is None
+    assert get_uniform_decode_token_count(2, 12, 8, True) is None
 
 
 def test_no_speculator_dispatches_on_query_length_alone():
