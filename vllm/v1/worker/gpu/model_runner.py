@@ -1237,10 +1237,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping_np
         ]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        has_prefill = bool(is_prefilling_np.any())
 
-        if self.adaptive_verification is not None and draft_tokens:
-            num_toks = self.adaptive_verification.get_num_tokens(
-                num_tokens_per_req, draft_tokens
+        num_draft_tokens_np = None
+        if draft_tokens:
+            num_draft_tokens_np = np.fromiter(
+                (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            if self.adaptive_verification is not None:
+                num_toks = self.adaptive_verification.get_num_tokens(
+                    num_tokens_per_req, draft_tokens
+                )
+
+        prefill_runs_as_decode_np = None
+        if has_prefill and self.pcp_manager is None:
+            # One new prompt token over existing context, possibly padded with
+            # placeholder drafts, computes exactly like a decode. PCP partitions
+            # prefill rows.
+            num_new_tokens = num_scheduled_tokens
+            if num_draft_tokens_np is not None:
+                num_new_tokens = num_new_tokens - num_draft_tokens_np
+            prefill_runs_as_decode_np = (
+                is_prefilling_np
+                & (num_new_tokens == 1)
+                & (num_computed_prefill_tokens_np > 0)
             )
 
         batch_state = BatchReqState(
@@ -1251,7 +1273,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
-            has_prefill=bool(is_prefilling_np.any()),
+            has_prefill=has_prefill,
+            num_draft_tokens_np=num_draft_tokens_np,
+            prefill_runs_as_decode_np=prefill_runs_as_decode_np,
         )
         return batch_state, get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, batch_state.has_prefill
@@ -1305,11 +1329,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs, dtype=torch.int32, device=self.device
             )
         else:
-            num_draft_tokens_per_req = np.fromiter(
-                (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
-                dtype=np.int32,
-                count=num_reqs,
-            )
+            num_draft_tokens_per_req = batch_req_state.num_draft_tokens_np
+            if num_draft_tokens_per_req is None:
+                num_draft_tokens_per_req = np.zeros(num_reqs, dtype=np.int32)
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
@@ -1448,6 +1470,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
+            prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=is_padding,
@@ -2322,6 +2345,8 @@ class BatchReqState(NamedTuple):
     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
     is_prefilling_np: np.ndarray  # [num_reqs]
     has_prefill: bool
+    num_draft_tokens_np: np.ndarray | None  # [num_reqs], None if no drafts
+    prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
 
 
 def sort_batch_req_ids(
