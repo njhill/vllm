@@ -804,6 +804,74 @@ def test_resumed_request_checkpoint_matches_worker_position():
     assert hit is None or hit[0] is not checkpoint_block
 
 
+@pytest.mark.parametrize(
+    "hash_block_size,mamba_block_size,use_eagle",
+    [(32, 32, False), (16, 32, False), (32, 32, True)],
+)
+@pytest.mark.parametrize("retention_interval", [0, None])
+@pytest.mark.parametrize(
+    "num_prompt_tokens,num_output_tokens",
+    [(104, 0), (200, 0), (40, 24), (40, 25), (150, 43)],
+)
+@pytest.mark.parametrize("chunk_blocks", [2, 100])
+def test_checkpoint_reservation_matches_worker(
+    hash_block_size,
+    mamba_block_size,
+    use_eagle,
+    retention_interval,
+    num_prompt_tokens,
+    num_output_tokens,
+    chunk_blocks,
+):
+    """The worker exports a checkpoint wherever `compute_mamba_prefill_checkpoints`
+    says, into whatever block sits at its column. Each chunk, the manager must
+    either reserve exactly that position and column, or leave the column null so
+    the export is masked; anything else publishes a hash over the wrong state.
+    Under sparse retention, only the prefill-end chunk may reserve one.
+    """
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_blocks=64,
+        use_eagle=use_eagle,
+        num_speculative_blocks=3 if use_eagle else 0,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = retention_interval
+    mamba_manager = manager.coordinator.single_type_managers[1]
+
+    request = make_request(
+        "req", list(range(num_prompt_tokens)), hash_block_size, sha256
+    )
+    request.append_output_token_ids(list(range(1000, 1000 + num_output_tokens)))
+    num_tokens = request.num_tokens
+    prefill_end = max(num_prompt_tokens, num_tokens - 1)
+
+    start = 0
+    while start < num_tokens:
+        end = min(start + chunk_blocks * mamba_block_size, num_tokens)
+        assert manager.allocate_slots(request, end - start) is not None
+        offsets, cols = compute_mamba_prefill_checkpoints(
+            [end],
+            [end - start],
+            hash_block_size=hash_block_size,
+            mamba_block_size=mamba_block_size,
+            checkpoint_alignment=16,
+            drop_eagle_block=use_eagle,
+        )
+        reserved = mamba_manager._checkpoints.get(request.request_id)
+        if reserved is not None:
+            assert reserved == (start + offsets[0], cols[0])
+            assert retention_interval is None or end >= prefill_end
+        elif offsets[0]:
+            assert mamba_manager.req_to_blocks[request.request_id][cols[0]].is_null
+        request.num_computed_tokens = end
+        manager.new_step_starts()
+        start = end
+
+
 def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
     hash_block_size = mamba_block_size = 32
     manager = make_full_mamba_manager(
