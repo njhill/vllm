@@ -13,6 +13,9 @@ import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+from vllm.model_executor.layers.mamba.checkpoint import (
+    compute_mamba_prefill_checkpoints,
+)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
@@ -760,6 +763,45 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     assert mamba_manager._checkpoints[request.request_id][0] == 224
     end_hash = request.block_hashes[224 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
+
+
+def test_resumed_request_checkpoint_matches_worker_position():
+    """A resumed request's final chunk ends one token past ``prefill_end``.
+    The worker writes the checkpoint keyed on the chunk end, so the manager
+    must publish the block at that same position, not one derived from
+    ``prefill_end``, or another request would load the wrong state.
+    """
+    hash_block_size = mamba_block_size = 32
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = 0
+    mamba_manager = manager.coordinator.single_type_managers[1]
+
+    request = make_request("resumed", list(range(40)), hash_block_size, sha256)
+    request.append_output_token_ids(list(range(1000, 1025)))
+    num_tokens = request.num_tokens
+    assert (num_tokens - 1) % hash_block_size == 0
+    assert manager.allocate_slots(request, num_tokens) is not None
+
+    offsets, cols = compute_mamba_prefill_checkpoints(
+        [num_tokens],
+        [num_tokens],
+        hash_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        checkpoint_alignment=16,
+        drop_eagle_block=False,
+    )
+    assert mamba_manager._checkpoints[request.request_id] == (offsets[0], cols[0])
+    checkpoint_block = mamba_manager.req_to_blocks[request.request_id][cols[0]]
+    assert checkpoint_block.block_hash_num_tokens == offsets[0]
+    stale_hash = request.block_hashes[0]
+    hit = manager.block_pool.get_cached_block(stale_hash, [1])
+    assert hit is None or hit[0] is not checkpoint_block
 
 
 def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
