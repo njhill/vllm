@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +10,9 @@ from vllm.v1.watermarking import GumbelWatermarker
 from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+    gather_draft_sampled,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -671,8 +672,8 @@ def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
     )
 
 
-def test_verify_rejects_unproposed_drafts():
-    """Zero drafts of a request padded before any proposal must be rejected."""
+def test_gather_draft_sampled_rejects_unproposed_drafts():
+    """Zero drafts padded onto a step starting in the prefill must be rejected."""
     torch.manual_seed(0)
     device = "cuda"
     num_trials = 256
@@ -692,46 +693,39 @@ def test_verify_rejects_unproposed_drafts():
     target_rest = torch.randn(VOCAB_SIZE, device=device)
     target_rest[0] = 20.0
     inputs["target_logits"].view(num_trials, K + 1, VOCAB_SIZE)[:, 1:] = target_rest
-    inputs["draft_sampled"].view(num_trials, K + 1)[:, 1:] = 0
+    input_ids = inputs.pop("draft_sampled")
+    input_ids.view(num_trials, K + 1)[:, 1:] = 0
 
-    has_proposed_drafts = torch.zeros(num_trials, dtype=torch.bool, device=device)
-    rejection_sampler = object.__new__(RejectionSampler)
-    rejection_sampler.sampler = SimpleNamespace(
-        apply_sampling_params=lambda logits, *args: logits,
-        req_states=SimpleNamespace(has_proposed_drafts=has_proposed_drafts),
-        sampling_states=SimpleNamespace(
-            temperature=SimpleNamespace(gpu=inputs["temperature"]),
-            seeds=SimpleNamespace(gpu=inputs["seed"]),
-        ),
-        use_fp64_gumbel=False,
-    )
-    rejection_sampler.num_speculative_steps = K
-    rejection_sampler.synthetic_conditional_rates = None
-    rejection_sampler.use_block_verification = True
-    rejection_sampler.watermark_key = None
+    # Each request's first logit is the last prefill token, as in the first
+    # decode step after a P/D remote KV load.
+    positions = inputs["pos"]
+    first_pos = positions.view(num_trials, K + 1)[:, 0]
+    prefill_len = first_pos + 1
 
     def verify() -> tuple[torch.Tensor, torch.Tensor]:
-        _, sampled, num_sampled = rejection_sampler._verify(
-            inputs["target_logits"],
-            inputs["draft_logits"],
-            inputs["draft_sampled"].clone(),
-            inputs["pos"],
-            inputs["cu_num_logits"],
-            inputs["idx_mapping"],
-            None,
+        draft_sampled, pos = gather_draft_sampled(
+            input_ids,
+            positions,
+            torch.arange(input_ids.shape[0], device=device),
             inputs["expanded_idx_mapping"],
             inputs["expanded_local_pos"],
-            None,
+            prefill_len,
         )
-        return sampled, num_sampled
+        assert torch.equal(pos, positions)
+        return rejection_sample(
+            **{**inputs, "pos": pos},
+            draft_sampled=draft_sampled,
+            num_speculative_steps=K,
+            use_block_verification=True,
+        )
 
     sampled, num_sampled = verify()
     assert (num_sampled == 1).all()
     # Resampled from the target at row 0, not from a residual.
     assert (sampled[:, 0] != 0).all()
 
-    # Once proposed, block verification accepts the same zero drafts.
-    has_proposed_drafts.fill_(True)
+    # Once past the prefill, block verification accepts the same zero drafts.
+    prefill_len.copy_(first_pos)
     _, num_sampled = verify()
     assert (num_sampled == K + 1).all()
 
