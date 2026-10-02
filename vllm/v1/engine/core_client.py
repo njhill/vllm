@@ -51,7 +51,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineShutdown
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -484,10 +484,14 @@ class BackgroundResources:
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    # Set if the engines were shut down deliberately rather than dying.
+    shutdown_requested: bool = False
 
     def __call__(self):
         """Clean up background resources."""
         logger.debug_once("[shutdown] MPClient: background resource cleanup start")
+        if not self.engine_dead:
+            self.shutdown_requested = True
         self.engine_dead = True
         if self.engine_manager is not None:
             self.engine_manager.shutdown(
@@ -770,9 +774,11 @@ class MPClient(EngineCoreClient):
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
-        return (
-            EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
-        )
+        if self.resources.shutdown_requested:
+            return EngineShutdown(suppress_context=True)
+        if self.resources.engine_dead:
+            return EngineDeadError(suppress_context=True)
+        return e
 
     def ensure_alive(self):
         if self.resources.engine_dead:

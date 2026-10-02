@@ -12,10 +12,18 @@ class EngineGenerateError(VLLMServerError):
 class EngineDeadError(VLLMServerError):
     """Raised when the EngineCore dies. Unrecoverable."""
 
-    def __init__(self, *args, suppress_context: bool = False, **kwargs):
-        ENGINE_DEAD_MESSAGE = "EngineCore encountered an issue. See stack trace (above) for the root cause."  # noqa: E501
+    message = (
+        "EngineCore encountered an issue. See stack trace (above) for the root cause."
+    )
 
-        super().__init__(ENGINE_DEAD_MESSAGE, *args, **kwargs)
+    def __init__(self, *args, suppress_context: bool = False, **kwargs):
+        super().__init__(self.message, *args, **kwargs)
         # Make stack trace clearer when using with LLMEngine by
         # silencing irrelevant ZMQError.
         self.__suppress_context__ = suppress_context
+
+
+class EngineShutdown(EngineDeadError):
+    """Raised when the EngineCore has been deliberately shut down."""
+
+    message = "EngineCore has been shut down."
