@@ -7,7 +7,6 @@ import socket
 import sys
 import threading
 import time
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -523,11 +522,6 @@ def test_reuseport_workers_have_independent_accept_queues(
             input_addresses=["tcp://127.0.0.1:0"] * num_servers,
             output_addresses=["tcp://127.0.0.1:0"] * num_servers,
             target_server_fn=report_listener_worker,
-            socket_factory=(
-                partial(create_server_socket, address, reuse_port=True)
-                if num_servers > 1 and reuse_port
-                else None
-            ),
         )
         try:
             listeners = []

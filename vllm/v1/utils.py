@@ -4,6 +4,8 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import socket
+import sys
 import threading
 import time
 import weakref
@@ -182,7 +184,6 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
-        socket_factory: Callable[[], Any] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -195,14 +196,15 @@ class APIServerProcessManager:
         Args:
             target_server_fn: Override function to call for each API server process
             listen_address: Address to listen for client connections
-            sock: Borrowed socket, passed to workers only without socket_factory.
+            sock: Socket for client connections. With multiple servers on
+                Linux, a TCP socket with SO_REUSEPORT only reserves the port
+                and each worker gets its own listener on the same address.
             args: Command line arguments
             num_servers: Number of API server processes to start
             input_addresses: Input addresses for each API server
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
-            socket_factory: Fresh socket per worker, closed in parent after spawn.
 
         """
         self.listen_address = listen_address
@@ -221,6 +223,21 @@ class APIServerProcessManager:
                 "q",
                 SharedAdmissionStats.num_counters(num_servers),
             )
+
+        # Give each worker its own SO_REUSEPORT listener so that the kernel
+        # distributes connections. Other platforms don't load-balance
+        # between SO_REUSEPORT listeners, so they keep a shared socket.
+        independent_listeners = (
+            num_servers > 1
+            and sys.platform == "linux"
+            and isinstance(sock, socket.socket)
+            and sock.family in (socket.AF_INET, socket.AF_INET6)
+            and sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) != 0
+        )
+        if independent_listeners:
+            from vllm.entrypoints.launchers.launcher import create_server_socket
+
+            sock_addr = sock.getsockname()
 
         for i, in_addr, out_addr in zip(
             range(num_servers), input_addresses, output_addresses
@@ -242,12 +259,13 @@ class APIServerProcessManager:
             self._address_pipes.append(parent_recv)
             client_config["actual_address_pipe"] = child_send
 
-            with (
-                child_send,
-                socket_factory()
-                if socket_factory is not None
-                else contextlib.nullcontext(sock) as worker_sock,
-            ):
+            worker_sock_ctx = (
+                create_server_socket(sock_addr, reuse_port=True)
+                if independent_listeners
+                else contextlib.nullcontext(sock)
+            )
+            # Drop parent's write end after spawn so reader sees EOF on child death.
+            with child_send, worker_sock_ctx as worker_sock:
                 proc = spawn_context.Process(
                     target=target_server_fn or run_api_server_worker_proc,
                     name=f"ApiServer_{i}",
