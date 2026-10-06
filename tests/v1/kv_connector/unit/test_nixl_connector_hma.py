@@ -1615,6 +1615,7 @@ def test_mamba_n1_p_side_truncation():
     assert len(req.prompt_token_ids) == original_len - 1
     assert req.num_prompt_tokens == original_len - 1
     assert req.max_tokens == 1
+    assert req.discard_output_tokens
     assert req.kv_transfer_params["_p_side_truncated"] is True
 
     count, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
@@ -1670,6 +1671,8 @@ def test_mamba_n1_p_side_truncation():
     mm_req.mm_features = [whole]
     fa_sched.on_new_request(mm_req)
     assert mm_req.num_prompt_tokens == 10 and mm_req.mm_features == [whole]
+    # Uncut, its token is still not returned: the decoder samples the first.
+    assert mm_req.discard_output_tokens and mm_req.max_tokens == 1
     d_req = create_request(num_tokens=10, do_remote_prefill=True)
     d_req.mm_features = [whole]
     assert fa_sched.get_num_new_matched_tokens(d_req, 0) == (0, False)
@@ -1680,6 +1683,7 @@ def test_mamba_n1_p_side_truncation():
     logprobs_req.sampling_params.skip_reading_prefix_cache = True
     fa_sched.on_new_request(logprobs_req)
     assert logprobs_req.num_prompt_tokens == len(logprobs_req.prompt_token_ids) == 10
+    assert logprobs_req.discard_output_tokens
 
     # In-process parallel samples share the prompt and kv_transfer_params;
     # each sample is cut on its own without touching the other's.

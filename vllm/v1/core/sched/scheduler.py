@@ -2231,6 +2231,11 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
+            if request.discard_output_tokens:
+                # The sampled tokens still count toward stopping, but are not
+                # outputs (see Request.discard_output_tokens).
+                new_token_ids, new_logprobs, new_sampling_mask = [], None, None
+
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             prompt_token_id_logprobs = prompt_token_id_logprobs_dict.get(req_id)

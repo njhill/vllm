@@ -60,6 +60,8 @@ def test_basic_lifecycle():
     output = engine_core_outputs[0].outputs[0]
     assert output.finish_reason == FinishReason.LENGTH
     assert output.kv_transfer_params is not None
+    # The prefill stopped short of the prompt, so its token is not an output.
+    assert output.new_token_ids == [] and output.new_logprobs is None
 
     # Request freed in Scheduler and in Persistent Batch ...
     assert request_id in scheduler.finished_req_ids
@@ -153,6 +155,40 @@ def test_short_prompt_lifecycle():
     # We need to mark sending finish to clear data for persistent batch.
     scheduler_output = scheduler.schedule()
     # Use create_model_runner_output to pass kv_connector_output along
+    model_runner_output = create_model_runner_output(
+        reqs=[request], finished_sending={request.request_id}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert_scheduler_empty(scheduler)
+
+
+def test_uncut_prefill_returns_no_token():
+    """A prefill the connector does not cut (here one with prompt logprobs,
+    which skips reading the prefix cache) samples a real token, but returns
+    none either, as the decoder samples the first output token."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    request = create_request(
+        request_id=1,
+        block_size=vllm_config.cache_config.block_size,
+        num_tokens=24,
+        do_remote_decode=True,
+    )
+    request.sampling_params.skip_reading_prefix_cache = True
+    request.max_tokens = 16
+
+    scheduler.add_request(request)
+    assert request.num_prompt_tokens == 24
+    assert request.max_tokens == 1
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output(reqs=[request], token_id=7)
+    eco = scheduler.update_from_output(scheduler_output, model_runner_output)
+    output = eco[0].outputs[0]
+    assert output.finish_reason == FinishReason.LENGTH
+    assert output.new_token_ids == []
+    assert output.kv_transfer_params is not None
+
+    scheduler_output = scheduler.schedule()
     model_runner_output = create_model_runner_output(
         reqs=[request], finished_sending={request.request_id}
     )

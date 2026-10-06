@@ -166,6 +166,10 @@ class Request:
         # Drop the stale output instead, for same-step preempt + resume
         # (reset_prefix_cache).
         self.drop_stale_output = False
+        # Finish without emitting sampled tokens, which are not outputs: set
+        # for a P/D prefill request, as the decoder samples the first output
+        # token (and a prefiller that cut the prompt short samples a prompt one).
+        self.discard_output_tokens = False
 
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them

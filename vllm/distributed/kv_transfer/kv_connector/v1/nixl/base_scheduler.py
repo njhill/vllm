@@ -198,6 +198,11 @@ class NixlBaseConnectorScheduler:
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
             self._truncate_request_for_prefill(request)
+            # The decoder samples the first output token. The prefiller's
+            # token is not returned, whether its prompt was cut (the token then
+            # predicts a prompt token) or not, so P/D callers see one contract.
+            request.max_tokens = 1
+            request.discard_output_tokens = True
 
         # NOTE (NickLucche) This excludes request meant for P, ie heartbeats are
         # effectively disabled for Bidirectional KV transfer.
@@ -412,7 +417,6 @@ class NixlBaseConnectorScheduler:
             and 0 < stop < request.num_prompt_tokens
         ):
             truncate_prompt_for_prefill(request, stop)
-            request.max_tokens = 1
             # Parallel samples can share kv_transfer_params in-process.
             request.kv_transfer_params = {**params, "_p_side_truncated": True}
 
