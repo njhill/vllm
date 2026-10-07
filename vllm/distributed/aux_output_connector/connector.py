@@ -67,12 +67,12 @@ class AuxOutputSchedulerConnector:
                 block_hashes_by_request[request_id] = packed
             self._sent_hash_counts[request_id] = len(request.block_hashes)
             assert request.sampling_params is not None
-            # A P/D prefiller may cut the prompt short of the requested start.
+            prompt_start = request.sampling_params.routed_experts_prompt_start
+            if request.prefill_stop is not None:
+                # A P/D prefiller computes the prompt only up to its stop.
+                prompt_start = min(prompt_start, request.prefill_stop)
             scheduled_requests[request_id] = max(
-                min(
-                    request.sampling_params.routed_experts_prompt_start,
-                    request.num_prompt_tokens,
-                ),
+                prompt_start,
                 0 if request.num_output_tokens == 0 else request.num_tokens - 1,
             )
         # A settled token can complete a hash block after the next async schedule

@@ -15,7 +15,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     clip_ssm_state_blocks,
     get_prefill_stop,
-    truncate_prompt_for_prefill,
     yield_req_data,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -197,10 +196,10 @@ class NixlBaseConnectorScheduler:
         """Track a request that may need heartbeats."""
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
-            self._truncate_request_for_prefill(request)
-            # The decoder samples the first output token. The prefiller's
-            # token is not returned, whether its prompt was cut (the token then
-            # predicts a prompt token) or not, so P/D callers see one contract.
+            self._set_prefill_stop(request)
+            # The decoder samples the first output token. A prefill that stops
+            # short of the prompt samples nothing; one that computes the whole
+            # prompt does not return its token, so P/D callers see one contract.
             request.max_tokens = 1
             request.discard_output_tokens = True
 
@@ -399,26 +398,31 @@ class NixlBaseConnectorScheduler:
         will recompute locally."""
         return get_prefill_stop(request, self._prefill_backoff())
 
-    def _truncate_request_for_prefill(self, request: "Request") -> None:
-        """P-side only: drop the trailing ``_prefill_backoff()`` prompt tokens
-        so the prefiller stops short of what the decoder recomputes locally:
-        the last prompt token, or for multi-module MTP the drafter's whole
-        lookahead window.
-
-        Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
-        request is preempted and rescheduled."""
-        stop = get_prefill_stop(request, self._prefill_backoff())
-        params = request.kv_transfer_params
+    def _set_prefill_stop(self, request: "Request") -> None:
+        """P-side only: stop the prefill short of the trailing
+        ``_prefill_backoff()`` prompt tokens, which the decoder computes: the
+        last prompt token, or for multi-module MTP the drafter's whole
+        lookahead window. The prompt itself is kept whole."""
+        backoff = self._prefill_backoff()
+        stop = get_prefill_stop(request, backoff)
+        if stop == 0:
+            # Nothing to transfer: the decoder computes the whole prompt.
+            return
+        sampling_params = request.sampling_params
         if (
-            params is not None
-            # Guard against repeated truncation after preemption/reschedule.
-            and not params.get("_p_side_truncated")
-            # With nothing to transfer, the prefiller's own result is unused.
-            and 0 < stop < request.num_prompt_tokens
+            backoff > 1
+            and sampling_params is not None
+            and (
+                sampling_params.prompt_logprobs is not None
+                or sampling_params.prompt_logprob_token_ids is not None
+            )
         ):
-            truncate_prompt_for_prefill(request, stop)
-            # Parallel samples can share kv_transfer_params in-process.
-            request.kv_transfer_params = {**params, "_p_side_truncated": True}
+            # Stopping more than one token short would leave the last prompt
+            # logprobs uncomputed. The frontend rejects such requests (see
+            # InputProcessor._validate_kv_transfer_params); one that bypasses
+            # it computes the whole prompt, which the decoder does not expect.
+            return
+        request.prefill_stop = stop
 
     def _build_save_meta(
         self,

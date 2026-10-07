@@ -101,7 +101,7 @@ def test_hybrid_gdn_remote_prefill_uses_mamba_n_minus_one():
 
 
 @pytest.mark.cpu_test
-def test_hybrid_gdn_remote_decode_truncates_prefill_before_cache_lookup():
+def test_hybrid_gdn_remote_decode_stops_prefill_before_cache_lookup():
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
         kv_role="kv_producer",
@@ -118,22 +118,21 @@ def test_hybrid_gdn_remote_decode_truncates_prefill_before_cache_lookup():
     original_tokens = list(request.prompt_token_ids)
 
     connector.on_new_request(request)
-    assert request.prompt_token_ids == original_tokens[:-1]
-    assert request._all_token_ids == original_tokens[:-1]
-    assert request.num_prompt_tokens == len(original_tokens) - 1
+    assert request.prompt_token_ids == original_tokens
+    assert request.num_prompt_tokens == len(original_tokens)
+    assert request.prefill_stop == len(original_tokens) - 1
     assert request.max_tokens == 1
     assert request.discard_output_tokens
-    assert request.kv_transfer_params["_p_side_truncated"] is True
 
-    # Re-adding or rescheduling the request must not truncate another token.
+    # Re-adding or rescheduling the request keeps the same stop.
     scheduler.on_new_request(request)
-    assert request.prompt_token_ids == original_tokens[:-1]
+    assert request.prefill_stop == len(original_tokens) - 1
 
     # Prefix-cache matching must not mutate the request after its local lookup.
     with patch.object(
         scheduler,
-        "_truncate_request_for_prefill",
-        side_effect=AssertionError("late Mamba truncation"),
+        "_set_prefill_stop",
+        side_effect=AssertionError("late Mamba prefill stop"),
     ):
         num_new_tokens, is_async = scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens=0

@@ -54,6 +54,8 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # P/D prefill: computed only up to here; see Request.prefill_stop.
+    prefill_stop: int | None = None
 
     @classmethod
     def from_request(
@@ -80,6 +82,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            prefill_stop=request.prefill_stop,
         )
 
     @property

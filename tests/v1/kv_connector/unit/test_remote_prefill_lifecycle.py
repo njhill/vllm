@@ -615,11 +615,11 @@ def test_kv_fetch_stages_cleared_on_abort():
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.current_platform"
 )
 def test_p_side_chunked_prefill_mamba(mock_platform):
-    """P-side integration: Mamba N-1 truncation + chunked prefill completes.
+    """P-side integration: Mamba N-1 prefill stop + chunked prefill completes.
 
-    A 64-token P-side request is truncated to 63 by the N-1 fix, then
-    chunked into two prefill steps (32 + 31) and finishes with
-    LENGTH_CAPPED because max_tokens is set to 1.
+    A 64-token P-side request keeps its prompt but stops its prefill at 63,
+    chunked into two prefill steps (32 + 31). Both are partial prefills, so
+    nothing is sampled, and it finishes with LENGTH_CAPPED at the stop.
     """
     mock_platform.device_type = "cpu"
 
@@ -653,8 +653,8 @@ def test_p_side_chunked_prefill_mamba(mock_platform):
     # ── Step 1: first chunk ──
     scheduler_output = scheduler.schedule()
 
-    assert len(request.prompt_token_ids) == NUM_TOKENS - 1
-    assert request.max_tokens == 1
+    assert len(request.prompt_token_ids) == NUM_TOKENS
+    assert request.prefill_stop == NUM_TOKENS - 1
     assert scheduler_output.num_scheduled_tokens[request_id] == BATCH_SIZE
     assert request.num_computed_tokens == BATCH_SIZE
 
@@ -673,14 +673,17 @@ def test_p_side_chunked_prefill_mamba(mock_platform):
     assert scheduler_output.num_scheduled_tokens[request_id] == remaining
     assert request.num_computed_tokens == NUM_TOKENS - 1
 
-    # Prefill complete: model generates 1 decode token
-    final_output = create_model_runner_output([request])
-    engine_core_outputs = scheduler.update_from_output(scheduler_output, final_output)
+    # The prefill reaches its stop: still a partial prefill, nothing sampled.
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output, intermediate_output
+    )
 
-    # max_tokens=1 → request finishes with LENGTH
+    # The request finishes with LENGTH at its stop, returning no token.
     outputs = engine_core_outputs[0].outputs
     assert len(outputs) == 1
     assert outputs[0].finish_reason == FinishReason.LENGTH
+    assert outputs[0].new_token_ids == []
+    assert outputs[0].kv_transfer_params is not None
 
 
 def test_async_load_reserves_blocks_for_inflight():

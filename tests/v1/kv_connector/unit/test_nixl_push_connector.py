@@ -131,21 +131,21 @@ def _stub_sw_clipping(scheduler) -> None:
 
 
 class TestPushScheduler:
-    def test_p_side_mamba_truncates_before_cache_lookup(self):
-        """Push mode normalizes P-side Mamba requests before cache lookup."""
+    def test_p_side_mamba_stops_prefill_before_cache_lookup(self):
+        """Push mode sets the P-side prefill stop before cache lookup."""
         sched = make_nixl_push_scheduler(has_mamba=True)
         request = create_request(num_tokens=10, do_remote_decode=True)
         original_len = len(request.prompt_token_ids)
 
         sched.on_new_request(request)
 
-        assert len(request.prompt_token_ids) == original_len - 1
-        assert request.kv_transfer_params["_p_side_truncated"] is True
+        assert len(request.prompt_token_ids) == original_len
+        assert request.prefill_stop == original_len - 1
 
         with patch.object(
             sched,
-            "_truncate_request_for_prefill",
-            side_effect=AssertionError("must not truncate after cache lookup"),
+            "_set_prefill_stop",
+            side_effect=AssertionError("must not set the stop after cache lookup"),
         ):
             assert sched.get_num_new_matched_tokens(request, 0) == (0, False)
 

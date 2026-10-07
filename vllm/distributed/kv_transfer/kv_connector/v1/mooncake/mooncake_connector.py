@@ -27,7 +27,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TransferTopology,
     get_current_attn_backends,
     get_prefill_stop,
-    truncate_prompt_for_prefill,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -946,31 +945,20 @@ class MooncakeConnectorScheduler:
         sliding window the token attends to) must be laid out for it."""
         return get_prefill_stop(request, 1)
 
-    def _truncate_request_for_prefill(self, request: "Request") -> None:
-        """P-side only: drop the last prompt token, which the decoder
-        recomputes, so the prefiller lays out its state for that token.
-
-        Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
-        request is preempted and rescheduled."""
-        stop = get_prefill_stop(request, 1)
-        params = request.kv_transfer_params
-        if (
-            params is not None
-            and not params.get("_p_side_truncated")
-            # With nothing to transfer, the prefiller's own result is unused.
-            and 0 < stop < request.num_prompt_tokens
-        ):
-            truncate_prompt_for_prefill(request, stop)
-            # Parallel samples can share kv_transfer_params in-process.
-            request.kv_transfer_params = {**params, "_p_side_truncated": True}
+    def _set_prefill_stop(self, request: "Request") -> None:
+        """P-side only: stop the prefill short of the last prompt token, which
+        the decoder recomputes, so the prefiller lays out its state for that
+        token. The prompt itself is kept whole."""
+        if stop := get_prefill_stop(request, 1):
+            request.prefill_stop = stop
 
     def on_new_request(self, request: "Request") -> None:
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
-            self._truncate_request_for_prefill(request)
-            # The decoder samples the first output token. The prefiller's
-            # token is not returned, whether its prompt was cut (the token then
-            # predicts a prompt token) or not, so P/D callers see one contract.
+            self._set_prefill_stop(request)
+            # The decoder samples the first output token. A prefill that stops
+            # short of the prompt samples nothing; one that computes the whole
+            # prompt does not return its token, so P/D callers see one contract.
             request.max_tokens = 1
             request.discard_output_tokens = True
 

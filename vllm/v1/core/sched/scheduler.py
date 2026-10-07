@@ -440,9 +440,9 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        # Split only during prefill: `request.num_tokens - 1` extends this to
-        # resumed requests replaying their output tokens.
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        # Split only during prefill, which extends to the output tokens a
+        # resumed request replays, or ends early at a P/D prefill stop.
+        prefill_end = request.prefill_end
         if start >= prefill_end:
             return num_new_tokens
 
@@ -563,7 +563,11 @@ class Scheduler(SchedulerInterface):
         Either finish the prefill or leave at least num_prefill_lookahead for
         the next chunk. No-op for eagle-family drafters (lookahead 1).
         """
-        remaining = request.num_tokens - num_computed_tokens - num_new_tokens
+        # A P/D prefill stop ends the prefill.
+        end = request.num_tokens
+        if request.prefill_stop is not None:
+            end = request.prefill_stop
+        remaining = end - num_computed_tokens - num_new_tokens
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
@@ -685,6 +689,11 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.prefill_stop is not None:
+                # A P/D prefill computes the prompt up to its stop.
+                num_new_tokens = min(
+                    num_new_tokens, request.prefill_stop - request.num_computed_tokens
+                )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -978,6 +987,14 @@ class Scheduler(SchedulerInterface):
                             ext_tokens -= ext_tokens % self.block_size
                             load_kv_async = load_kv_async and ext_tokens > 0
 
+                        if request.prefill_stop is not None:
+                            # A P/D prefill computes at least the token before
+                            # its stop; a connector capping its hit at the
+                            # prompt (e.g. offloading) can reach the stop.
+                            max_cap = request.max_cache_hit_tokens - block_aligned_local
+                            ext_tokens = min(ext_tokens, max(max_cap, 0))
+                            load_kv_async = load_kv_async and ext_tokens > 0
+
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
                             # sub-block tail so no CoW is needed, and let the load
@@ -1093,12 +1110,17 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if request.prefill_stop is not None:
+                        # A P/D prefill computes the prompt up to its stop.
+                        num_new_tokens = request.prefill_stop - num_computed_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        request.prefill_stop is None
+                        and self.num_spec_tokens > 0
+                        and self.dynamic_sd_lookup is None
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
@@ -1882,11 +1904,15 @@ class Scheduler(SchedulerInterface):
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
+            # A P/D prefill stop inside the item covers it once reached: the
+            # decoder computes the rest of the item.
+            item_end = start_pos + num_encoder_tokens
+            if request.prefill_stop is not None:
+                item_end = min(item_end, request.prefill_stop)
             if (
                 self.scheduler_config.disable_chunked_mm_input
                 and num_computed_tokens < start_pos
-                and (num_computed_tokens + num_new_tokens)
-                < (start_pos + num_encoder_tokens)
+                and (num_computed_tokens + num_new_tokens) < item_end
             ):
                 # Account for EAGLE shift when rolling back to avoid
                 # encoder cache miss. This ensures the scheduled range
@@ -2137,6 +2163,18 @@ class Scheduler(SchedulerInterface):
             ec_transfer_params = None
             prefill_stats = None
             status_before_stop = request.status
+
+            if request.prefill_stop is not None:
+                # A P/D prefill stops short of the prompt, so its steps are all
+                # partial prefills and sample nothing. It finishes once the
+                # step reaching its stop has run (not just been scheduled).
+                new_token_ids = []
+                settled_tokens = (
+                    request.num_computed_tokens - request.num_in_flight_tokens
+                )
+                if settled_tokens >= request.prefill_stop:
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                    stopped = True
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -3049,7 +3087,7 @@ class Scheduler(SchedulerInterface):
             num_local_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
-            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+            prefill_end=request.prefill_end,
         )
         return num_blocks + self._spec_decode_step_blocks()
 

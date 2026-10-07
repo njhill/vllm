@@ -168,8 +168,13 @@ class Request:
         self.drop_stale_output = False
         # Finish without emitting sampled tokens, which are not outputs: set
         # for a P/D prefill request, as the decoder samples the first output
-        # token (and a prefiller that cut the prompt short samples a prompt one).
+        # token.
         self.discard_output_tokens = False
+        # P/D prefiller: compute the prompt only up to this position, then
+        # finish without sampling. The decoder loads the KV up to here and
+        # computes the rest. The prompt itself is kept whole, so prompt
+        # logprobs and multimodal items past the stop stay intact.
+        self.prefill_stop: int | None = None
 
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
@@ -298,6 +303,23 @@ class Request:
     @property
     def num_tokens(self) -> int:
         return len(self._all_token_ids)
+
+    @property
+    def prefill_end(self) -> int:
+        """Where prefill ends: the prompt (extended to the output tokens a
+        resumed request replays), or an earlier P/D prefill stop."""
+        if self.prefill_stop is not None:
+            return self.prefill_stop
+        return max(self.num_prompt_tokens, self.num_tokens - 1)
+
+    @property
+    def max_cache_hit_tokens(self) -> int:
+        """The longest prefix a cache hit may cover, leaving at least one
+        token to compute: the last one, to sample from, or the last one before
+        a P/D prefill stop."""
+        if self.prefill_stop is not None:
+            return self.prefill_stop - 1
+        return self.num_tokens - 1
 
     @property
     def num_tokens_with_spec(self) -> int:

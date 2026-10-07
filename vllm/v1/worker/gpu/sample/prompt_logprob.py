@@ -41,14 +41,23 @@ class PromptLogprobsWorker:
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
+        # P/D prefill stop (0 if none): the prompt is computed only up to here.
+        self.prefill_stop = np.zeros(self.max_num_reqs, dtype=np.int32)
         # req_idx -> list of in-progress LogprobsTensors
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
         # req_id -> fixed-ID scoring state
         self.token_id_scores: dict[str, _TokenIdScores] = {}
 
-    def add_request(self, req_id: str, req_idx: int, sampling_params: SamplingParams):
+    def add_request(
+        self,
+        req_id: str,
+        req_idx: int,
+        sampling_params: SamplingParams,
+        prefill_stop: int | None = None,
+    ):
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
+        self.prefill_stop[req_idx] = prefill_stop or 0
         self.num_prompt_logprobs[req_idx] = sampling_params.prompt_logprobs or 0
         if uses_prompt_logprobs:
             self.in_progress_prompt_logprobs[req_id] = []
@@ -82,7 +91,9 @@ class PromptLogprobsWorker:
             req = self.token_id_scores.get(req_id)
             if req is None:
                 continue
-            prompt_len = int(prompt_lens[input_batch.idx_mapping_np[i]])
+            req_idx = input_batch.idx_mapping_np[i]
+            prompt_len = int(prompt_lens[req_idx])
+            prefill_stop = int(self.prefill_stop[req_idx])
             chunk_start = int(input_batch.num_computed_prefill_tokens_np[i])
             chunk_end = chunk_start + int(input_batch.num_scheduled_tokens[i])
             # Skip decode steps and, as compute_prompt_logprobs does, requests
@@ -111,7 +122,9 @@ class PromptLogprobsWorker:
                     if logits_mode
                     else compute_token_logprobs(logits, ids)
                 )
-            if chunk_end >= prompt_len:
+            # A P/D prefill stopping short of the prompt has scored every
+            # prompt row once it reaches its stop.
+            if chunk_end >= prompt_len or 0 < prefill_stop <= chunk_end:
                 req.scores.masked_fill_(req.pad, float("-inf"))
                 out[req_id] = req.scores
                 self.token_id_scores.pop(req_id, None)
@@ -174,6 +187,11 @@ class PromptLogprobsWorker:
 
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
+        # A P/D prefill stopping short of the prompt has every prompt logprob
+        # once it reaches its stop, since even its last row's target is a
+        # prompt token. It finishes there, so return them then.
+        prefill_stops = self.prefill_stop[idx_mapping_np]
+        reaches_stop = (prefill_stops > 0) & (pos_after_step >= prefill_stops)
 
         query_start_loc_np = input_batch.query_start_loc_np
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
@@ -210,7 +228,7 @@ class PromptLogprobsWorker:
             prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
             if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
                 prompt_logprobs_list.append(logprobs)
-            if req_is_prompt_chunked:
+            if req_is_prompt_chunked and not reaches_stop[i]:
                 # Prompt is chunked. Do not return the logprobs yet.
                 continue
 

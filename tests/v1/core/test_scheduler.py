@@ -6142,6 +6142,52 @@ def test_eagle3_mm_encoder_cache_with_shift():
     )
 
 
+@pytest.mark.parametrize("prefill_lookahead", [0, 1])
+def test_pd_prefill_stop_inside_mm_item(prefill_lookahead):
+    """A P/D prefill whose prompt ends in an image stops one token short, inside
+    the image. With disable_chunked_mm_input (and an EAGLE prefill lookahead),
+    reaching the stop counts as covering the image: the encoder input is
+    scheduled and the prefill finishes at its stop, sampling nothing."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1024,
+        disable_chunked_mm_input=True,
+        max_model_len=2048,
+    )
+    scheduler.num_prefill_lookahead = prefill_lookahead
+    mm_start_pos, mm_length = 100, 576
+    request = create_requests(
+        num_requests=1,
+        num_tokens=mm_start_pos + mm_length,
+        mm_positions=[[PlaceholderRange(offset=mm_start_pos, length=mm_length)]],
+    )[0]
+    request.prefill_stop = request.num_prompt_tokens - 1
+    req_id = request.request_id
+    scheduler.add_request(request)
+
+    encoder_scheduled = False
+    for _ in range(3):
+        output = scheduler.schedule()
+        encoder_scheduled |= req_id in output.scheduled_encoder_inputs
+        engine_core_outputs = scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: 0},
+                sampled_token_ids=[[]],
+            ),
+        )
+        if request.is_finished():
+            break
+
+    assert encoder_scheduled
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.num_computed_tokens == request.prefill_stop
+    (finished,) = engine_core_outputs[0].outputs
+    assert finished.finish_reason == FinishReason.LENGTH
+    assert finished.new_token_ids == []
+
+
 def test_free_encoder_inputs_respects_unconfirmed_placeholders():
     """Regression test for issue #38551 (rollback path): under async
     scheduling with speculative decoding, num_computed_tokens is advanced

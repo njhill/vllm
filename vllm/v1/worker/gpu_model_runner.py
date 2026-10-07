@@ -1309,6 +1309,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prefill_stop=new_req_data.prefill_stop,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -5634,6 +5635,15 @@ class GPUModelRunner(
                 # but we want to defer returning them to the next step where we
                 # have new generated tokens to return.
                 num_logits = num_tokens
+                if (
+                    request.prefill_stop is not None
+                    and start_idx + num_tokens >= request.prefill_stop
+                ):
+                    # A P/D prefill stopping short of the prompt finishes at
+                    # its stop, having every prompt logprob by then: even its
+                    # last row's target is a prompt token.
+                    completed_prefill_reqs.append(req_id)
+                    prompt_logprobs_dict[req_id] = logprobs_tensors
             else:
                 # This is the last chunk of prompt tokens to return.
                 num_logits = num_remaining_tokens

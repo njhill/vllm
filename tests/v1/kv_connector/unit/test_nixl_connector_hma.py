@@ -1599,51 +1599,44 @@ def test_mamba_n1_d_side_builds_decode_metadata():
 
 
 @pytest.mark.cpu_test
-def test_mamba_n1_p_side_truncation():
-    """P-side truncates to N-1 before the scheduler's prefix-cache lookup.
+def test_p_side_prefill_stop():
+    """P-side stops its prefill at N-1, keeping the prompt whole, before the
+    scheduler's prefix-cache lookup; for Mamba and full attention alike.
 
-    Also verifies idempotency (calling again is a no-op) which is
-    needed for preemption safety via the _p_side_truncated guard,
-    and that full-attention models are truncated too.
+    The stop depends on the prompt length alone, so P and D agree even when
+    only one of them carries prompt logprobs or a multimodal item spans it.
+    Setting it again (preemption) is a no-op.
     """
-    sched = make_nixl_scheduler(has_mamba=True, is_hma_required=True)
-    req = create_request(num_tokens=10, do_remote_decode=True)
-    req.max_tokens = 128
-    original_len = len(req.prompt_token_ids)
+    for has_mamba, is_hma_required in ((True, True), (False, False)):
+        sched = make_nixl_scheduler(
+            has_mamba=has_mamba, is_hma_required=is_hma_required
+        )
+        req = create_request(num_tokens=10, do_remote_decode=True)
+        req.max_tokens = 128
+        original_tokens = list(req.prompt_token_ids)
 
-    sched.on_new_request(req)
-    assert len(req.prompt_token_ids) == original_len - 1
-    assert req.num_prompt_tokens == original_len - 1
-    assert req.max_tokens == 1
-    assert req.discard_output_tokens
-    assert req.kv_transfer_params["_p_side_truncated"] is True
+        sched.on_new_request(req)
+        assert req.prompt_token_ids == original_tokens
+        assert req.num_prompt_tokens == req.num_tokens == 10
+        assert req.prefill_stop == 9
+        assert req.max_tokens == 1
+        assert req.discard_output_tokens
+        # A P-side request loads nothing from D.
+        assert sched.get_num_new_matched_tokens(req, 0) == (0, False)
 
-    count, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
-
-    assert count == 0
-    assert is_async is False
-    assert len(req.prompt_token_ids) == original_len - 1
-
-    # Idempotency: re-adding a preempted request must not truncate further.
-    sched.on_new_request(req)
-    assert len(req.prompt_token_ids) == original_len - 1
+        # Idempotency: re-adding a preempted request keeps the same stop.
+        sched.on_new_request(req)
+        assert req.prefill_stop == 9 and req.prompt_token_ids == original_tokens
 
     fa_sched = make_nixl_scheduler(has_mamba=False, is_hma_required=False)
-    fa_req = create_request(num_tokens=10, do_remote_decode=True)
-    fa_original = len(fa_req.prompt_token_ids)
 
-    # A mixed token-id / embeddings prompt is cut consistently.
-    fa_req.prompt_embeds = torch.zeros(fa_original, 8)
-    fa_req.prompt_is_token_ids = [True] * (fa_original - 2) + [False] * 2
-    fa_sched.on_new_request(fa_req)
-    assert len(fa_req.prompt_token_ids) == fa_original - 1
-    assert len(fa_req.prompt_embeds) == fa_original - 1
-    assert len(fa_req.prompt_is_token_ids) == fa_original - 1
-    assert fa_req.num_tokens == fa_original - 1
+    def d_side_count(mm_features=()):
+        d_req = create_request(num_tokens=10, do_remote_prefill=True)
+        d_req.mm_features = list(mm_features)
+        return fa_sched.get_num_new_matched_tokens(d_req, 0)
 
-    # A prompt ending in an image is cut before the image rather than inside
-    # it, since models parse an item from its whole placeholder; the decoder
-    # loads the same prefix and computes the image itself.
+    # A prompt ending in an image keeps the image whole; the prefill stops
+    # inside it and the decoder loads the same prefix.
     image = MultiModalFeatureSpec(
         data=None,
         mm_position=PlaceholderRange(offset=4, length=6),
@@ -1653,49 +1646,25 @@ def test_mamba_n1_p_side_truncation():
     mm_req = create_request(num_tokens=10, do_remote_decode=True)
     mm_req.mm_features = [image]
     fa_sched.on_new_request(mm_req)
-    assert mm_req.num_prompt_tokens == len(mm_req.prompt_token_ids) == 4
-    assert mm_req.mm_features == []
-    d_req = create_request(num_tokens=10, do_remote_prefill=True)
-    d_req.mm_features = [image]
-    assert fa_sched.get_num_new_matched_tokens(d_req, 0) == (4, True)
+    assert mm_req.num_prompt_tokens == 10 and mm_req.mm_features == [image]
+    assert mm_req.prefill_stop == 9
+    assert d_side_count([image]) == (9, True)
 
-    # An item from the start of the prompt leaves no prefix to transfer: the
-    # prefiller keeps its prompt and the decoder computes all of it.
-    whole = MultiModalFeatureSpec(
-        data=None,
-        mm_position=PlaceholderRange(offset=0, length=10),
-        identifier="whole",
-        modality="image",
-    )
-    mm_req = create_request(num_tokens=10, do_remote_decode=True)
-    mm_req.mm_features = [whole]
-    fa_sched.on_new_request(mm_req)
-    assert mm_req.num_prompt_tokens == 10 and mm_req.mm_features == [whole]
-    # Uncut, its token is still not returned: the decoder samples the first.
-    assert mm_req.discard_output_tokens and mm_req.max_tokens == 1
-    d_req = create_request(num_tokens=10, do_remote_prefill=True)
-    d_req.mm_features = [whole]
-    assert fa_sched.get_num_new_matched_tokens(d_req, 0) == (0, False)
-
-    # A request that skips reading the prefix cache (prompt logprobs) is not
-    # cut: the decoder loads nothing and recomputes its whole prompt.
+    # Prompt logprobs don't move the stop: the prefill computes every prompt
+    # logprob by then, and a decoder without them loads the same prefix.
     logprobs_req = create_request(num_tokens=10, do_remote_decode=True)
+    logprobs_req.sampling_params.prompt_logprobs = 0
     logprobs_req.sampling_params.skip_reading_prefix_cache = True
     fa_sched.on_new_request(logprobs_req)
-    assert logprobs_req.num_prompt_tokens == len(logprobs_req.prompt_token_ids) == 10
-    assert logprobs_req.discard_output_tokens
+    assert logprobs_req.prefill_stop == 9
+    assert d_side_count() == (9, True)
 
-    # In-process parallel samples share the prompt and kv_transfer_params;
-    # each sample is cut on its own without touching the other's.
-    first = create_request(num_tokens=10, do_remote_decode=True)
-    second = create_request(num_tokens=10, do_remote_decode=True)
-    second.prompt_token_ids = first.prompt_token_ids
-    second.kv_transfer_params = first.kv_transfer_params
-    fa_sched.on_new_request(first)
-    fa_sched.on_new_request(second)
-    for sample in (first, second):
-        assert sample.num_prompt_tokens == len(sample.prompt_token_ids) == 9
-        assert sample.max_tokens == 1
+    # A 1-token prompt has no prefix to transfer: the prefiller computes it
+    # whole, and its token is not returned either.
+    short_req = create_request(num_tokens=1, do_remote_decode=True)
+    fa_sched.on_new_request(short_req)
+    assert short_req.prefill_stop is None
+    assert short_req.discard_output_tokens and short_req.max_tokens == 1
 
 
 @pytest.mark.cpu_test

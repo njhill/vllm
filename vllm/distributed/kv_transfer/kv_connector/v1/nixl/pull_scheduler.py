@@ -83,10 +83,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # in the prefill node local cache
             # The workers pair the two sides' blocks from the end of the
             # sequence, so the decode node's KV is reusable only if this
-            # request resumes where it ends, short of the last prompt token.
+            # request resumes where it ends, short of where its prefill stops.
             remote_num_tokens = params.get("remote_num_tokens") or 0
             count = 0
-            if remote_num_tokens < request.num_prompt_tokens:
+            if remote_num_tokens < request.prefill_end:
                 count = remote_num_tokens - num_computed_tokens
             if count > 0:
                 # Check kv_recompute_threshold: skip pull if

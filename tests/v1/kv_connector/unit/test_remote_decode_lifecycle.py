@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from unittest.mock import patch
 
 import pytest
+import torch
 
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    LogprobsTensors,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import FinishReason, RequestStatus
 
 from .utils import (
@@ -162,10 +169,10 @@ def test_short_prompt_lifecycle():
     assert_scheduler_empty(scheduler)
 
 
-def test_uncut_prefill_returns_no_token():
-    """A prefill the connector does not cut (here one with prompt logprobs,
-    which skips reading the prefix cache) samples a real token, but returns
-    none either, as the decoder samples the first output token."""
+def test_prompt_logprobs_prefill_stops_short():
+    """A prefill with prompt logprobs (which skips reading the prefix cache)
+    still stops at N-1, where it has every prompt logprob, so a decoder without
+    them loads the same prefix; it returns no token."""
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
     request = create_request(
@@ -174,18 +181,33 @@ def test_uncut_prefill_returns_no_token():
         num_tokens=24,
         do_remote_decode=True,
     )
+    request.sampling_params.prompt_logprobs = 0
     request.sampling_params.skip_reading_prefix_cache = True
     request.max_tokens = 16
 
     scheduler.add_request(request)
     assert request.num_prompt_tokens == 24
+    assert request.prefill_stop == 23
     assert request.max_tokens == 1
     scheduler_output = scheduler.schedule()
-    model_runner_output = create_model_runner_output(reqs=[request], token_id=7)
+    assert scheduler_output.num_scheduled_tokens[request.request_id] == 23
+    # The step reaching the stop returns all N-1 prompt logprobs, samples none.
+    prompt_logprobs = LogprobsTensors(
+        logprob_token_ids=torch.zeros(23, 1, dtype=torch.int32),
+        logprobs=torch.zeros(23, 1),
+        selected_token_ranks=torch.zeros(23, dtype=torch.int32),
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        prompt_logprobs_dict={request.request_id: prompt_logprobs},
+    )
     eco = scheduler.update_from_output(scheduler_output, model_runner_output)
     output = eco[0].outputs[0]
     assert output.finish_reason == FinishReason.LENGTH
     assert output.new_token_ids == []
+    assert output.new_prompt_logprobs_tensors is prompt_logprobs
     assert output.kv_transfer_params is not None
 
     scheduler_output = scheduler.schedule()
@@ -255,6 +277,79 @@ def test_prefix_cache_lifecycle():
     assert_scheduler_empty(scheduler)
 
 
+def test_prefix_hit_leaves_a_token_before_prefill_stop():
+    """A prefill that stops at N-1 on a block boundary must still compute a
+    token: its prefix-cache hit stops one short of the stop, as a normal
+    request's does of its prompt."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    NUM_TOKENS = 2 * BLOCK_SIZE + 1  # The prefill stops at 2 full blocks.
+
+    requests = []
+    for request_id, num_cached_blocks in ((1, 0), (2, 1)):
+        request = create_request(
+            request_id=request_id,
+            block_size=BLOCK_SIZE,
+            num_tokens=NUM_TOKENS,
+            common_prefix_len=NUM_TOKENS,
+            do_remote_decode=True,
+        )
+        requests.append(request)
+        scheduler.add_request(request)
+        assert request.prefill_stop == 2 * BLOCK_SIZE
+        scheduler_output = scheduler.schedule()
+        # The second request hits one block only, then computes the other.
+        assert scheduler_output.num_scheduled_tokens[request.request_id] == (
+            (2 - num_cached_blocks) * BLOCK_SIZE
+        )
+        # Stopping short of the prompt, the step is a partial prefill.
+        model_runner_output = ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        )
+        eco = scheduler.update_from_output(scheduler_output, model_runner_output)
+        (output,) = eco[0].outputs
+        assert output.finish_reason == FinishReason.LENGTH
+        assert output.new_token_ids == []
+
+    scheduler_output = scheduler.schedule()
+    model_runner_output = copy.deepcopy(EMPTY_MODEL_RUNNER_OUTPUT)
+    model_runner_output.kv_connector_output = KVConnectorOutput(
+        finished_sending={request.request_id for request in requests}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert_scheduler_empty(scheduler)
+
+
+def test_external_hit_leaves_a_token_before_prefill_stop():
+    """A connector on the prefiller that caps its hit at the prompt (as
+    offloading does) can report one reaching the stop; the scheduler trims it
+    so the prefill still computes a token."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    NUM_TOKENS = 2 * BLOCK_SIZE + 1
+    request = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=NUM_TOKENS,
+        do_remote_decode=True,
+    )
+    scheduler.add_request(request)
+    assert request.prefill_stop == NUM_TOKENS - 1
+
+    with patch.object(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        return_value=(NUM_TOKENS - 1, False),
+    ):
+        scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.num_computed_tokens == request.prefill_stop
+
+
 def test_abort_during_kv_transfer():
     """Test aborting request does not release blocks for remote decode."""
     vllm_config = create_vllm_config()
@@ -294,3 +389,41 @@ def test_abort_during_kv_transfer():
     )
     scheduler.update_from_output(scheduler_output, model_runner_output)
     assert_scheduler_empty(scheduler)
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 2, 3])
+@pytest.mark.parametrize("parameter", ["prompt_logprobs", "prompt_logprob_token_ids"])
+def test_prompt_logprobs_rejected_when_prefill_stops_further_short(
+    lookahead, parameter
+):
+    """A P/D prefill stops short of the drafter's lookahead window less one
+    (multi-module MTP); past one token it can't compute the last prompt
+    logprobs, so the frontend rejects such requests rather than let the
+    prefiller and decoder disagree on where the KV ends."""
+    from types import SimpleNamespace
+
+    from vllm import SamplingParams
+    from vllm.exceptions import VLLMValidationError
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    processor = SimpleNamespace(
+        vllm_config=SimpleNamespace(num_prefill_lookahead_tokens=lookahead)
+    )
+
+    def validate(params: SamplingParams) -> None:
+        InputProcessor._validate_kv_transfer_params(processor, params)
+
+    def make_params(kv_transfer_params) -> SamplingParams:
+        params = SamplingParams(extra_args={"kv_transfer_params": kv_transfer_params})
+        setattr(params, parameter, 1 if parameter == "prompt_logprobs" else [[1]])
+        return params
+
+    prefill = make_params({"do_remote_decode": True})
+    if lookahead > 2:
+        with pytest.raises(VLLMValidationError, match=parameter):
+            validate(prefill)
+    else:
+        validate(prefill)
+    # Only the prefill leg of a P/D request is affected.
+    validate(make_params({"do_remote_prefill": True}))
+    validate(make_params(None))

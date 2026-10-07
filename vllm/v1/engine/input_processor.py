@@ -135,6 +135,34 @@ class InputProcessor:
         )
         params.watermarking = watermarking
 
+    def _validate_kv_transfer_params(self, params: SamplingParams) -> None:
+        """Reject a P/D prefill request asking for prompt logprobs when the
+        prefill must stop more than one token short of the prompt.
+
+        With multi-module MTP of more than two speculative tokens, the prefill
+        leaves the drafter's lookahead window (several tokens) to the decoder,
+        so it cannot compute the last prompt logprobs. Computing the whole
+        prompt instead would leave the prefiller and decoder disagreeing on
+        where the transferred KV ends.
+        """
+        kv_transfer_params = (params.extra_args or {}).get("kv_transfer_params")
+        if not kv_transfer_params or not kv_transfer_params.get("do_remote_decode"):
+            return
+        if self.vllm_config.num_prefill_lookahead_tokens <= 2:
+            # The prefill stops one token short and computes every prompt
+            # logprob by then.
+            return
+        for parameter in ("prompt_logprobs", "prompt_logprob_token_ids"):
+            if getattr(params, parameter) is not None:
+                raise VLLMValidationError(
+                    f"{parameter} is not supported for a disaggregated prefill "
+                    "request with multi-module MTP of more than 2 speculative "
+                    "tokens: the prefill stops short of the last prompt tokens. "
+                    "Request prompt logprobs in a separate, non-disaggregated "
+                    "request.",
+                    parameter=parameter,
+                )
+
     def _validate_params(
         self,
         params: SamplingParams | PoolingParams,
@@ -175,6 +203,7 @@ class InputProcessor:
                     )
 
             self.validate_logits_processors_params(params)
+            self._validate_kv_transfer_params(params)
 
             if self.model_config.is_diffusion:
                 # Without --diffusion-config the served canvas is unknown here;
