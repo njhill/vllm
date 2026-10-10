@@ -295,12 +295,8 @@ class NixlBaseConnectorWorker:
         )
         fa_num_splits = len(plan.source_ranks_per_group[fa_idx])
 
-        src_strided_descs = src_blocks_data.tolist()
-        # Flat index of each strided desc's first block; the total is popped.
-        flat_desc_offsets = list(
-            itertools.accumulate((count for *_, count in src_strided_descs), initial=0)
-        )
-        num_descs = flat_desc_offsets.pop()
+        starts = self._strided_desc_starts(src_blocks_data)
+        num_descs = int(src_blocks_data[:, 4].sum())
         has_ssm_descs = num_fa_descs < num_descs
         ssm_idx = next(
             (i for i, t in enumerate(self._group_spec_types) if _is_ssm_spec(t)),
@@ -311,41 +307,35 @@ class NixlBaseConnectorWorker:
             if has_ssm_descs and ssm_idx is not None
             else 0
         )
-
-        # One replicate flag per FA strided desc, in _build_fa_local emission order.
-        fa_replicated = self._fa_desc_replicated(
-            [start for start in flat_desc_offsets if start < num_fa_descs],
-            num_fa_descs,
-            block_size_ratio,
-        )
         sharded_desc_end = num_descs - (
             self._logical_num_blocks if self._ple_region_index is not None else 0
         )
         assert num_fa_descs <= sharded_desc_end
 
-        assert block_size_ratio == 1 or fa_num_splits == 1 or all(fa_replicated), (
+        # REPLICATE (MLA) descs are read whole on every rank; SPLIT (full-attn)
+        # descs take this rank's head slice. SSM descs before the PLE pages are
+        # sharded by the rank's positional index; PLE pages are copied whole.
+        is_fa = starts < num_fa_descs
+        fa_replicated = self._fa_desc_replicated(
+            starts[is_fa], num_fa_descs, block_size_ratio
+        )
+        assert block_size_ratio == 1 or fa_num_splits == 1 or fa_replicated.all(), (
             "Head-sharded attention reads with P_TP > D_TP and heterogeneous "
             "block sizes are not supported"
         )
+        fa_split = is_fa.copy()
+        fa_split[is_fa] = ~fa_replicated
+        ssm_split = ~is_fa & (starts < sharded_desc_end)
 
         for p_idx, p_rank in enumerate(plan.all_source_ranks):
             fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
-
-            handle: list[tuple[int, int, int, int, int]] = []
-            for idx, ((addr, length, dev, stride, count), start) in enumerate(
-                zip(src_strided_descs, flat_desc_offsets)
-            ):
-                if start < num_fa_descs:
-                    # REPLICATE (MLA): whole block written on every rank.
-                    # SPLIT (full-attn): this rank's head slice.
-                    if not fa_replicated[idx]:
-                        length //= fa_num_splits
-                        addr += fa_slot * length
-                elif start < sharded_desc_end:
-                    length //= ssm_num_splits
-                    addr += p_idx * length
-                handle.append((addr, length, dev, stride, count))
-            yield self._pack_strided_descs(handle)
+            handle = src_blocks_data.copy()
+            handle[fa_split, 1] //= fa_num_splits
+            handle[fa_split, 0] += fa_slot * handle[fa_split, 1]
+            if ssm_num_splits:
+                handle[ssm_split, 1] //= ssm_num_splits
+                handle[ssm_split, 0] += p_idx * handle[ssm_split, 1]
+            yield handle
 
     def _needs_split_local_xfer_handles(self, tp_ratio: int, plan: TPMapping) -> bool:
         """Whether reads need per-source slices of the local KV region.
@@ -360,10 +350,10 @@ class NixlBaseConnectorWorker:
 
     def _fa_desc_replicated(
         self,
-        desc_starts: list[int],
+        desc_starts: np.ndarray,
         num_fa_descs: int,
         block_size_ratio: int = 1,
-    ) -> list[bool]:
+    ) -> np.ndarray:
         """Replicate flag per FA strided desc, given each one's flat block index.
 
         _build_fa_local emits regions in order, with
@@ -373,16 +363,16 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         n_regions = len(self.block_len_per_layer)
         if n_regions == 0 or self.num_regions == 0:
-            return [False] * len(desc_starts)
-        region_indices = list(self._transfer_layer_region_indices or range(n_regions))
+            return np.zeros(len(desc_starts), dtype=bool)
+        region_indices = self._transfer_layer_region_indices or range(n_regions)
         region_ends = np.cumsum(
             [self.region_num_blocks[i] * block_size_ratio for i in region_indices]
         )
         assert region_ends[-1] == num_fa_descs, (
             f"FA region blocks {region_ends[-1]} != num_fa_descs {num_fa_descs}"
         )
-        owners = np.searchsorted(region_ends, desc_starts, side="right")
-        return [self._is_region_replicated(region_indices[o]) for o in owners]
+        replicated = np.array([self._is_region_replicated(i) for i in region_indices])
+        return replicated[np.searchsorted(region_ends, desc_starts, side="right")]
 
     def _is_region_replicated(self, region_idx: int) -> bool:
         """Whether region ``region_idx`` is transferred REPLICATE vs SPLIT.
@@ -1979,14 +1969,9 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.block_strides[region_index]
                 * remote_physical_per_logical
             )
+            addr = nixl_agent_meta.kv_caches_base_addr[region_index]
             strided_descs.append(
-                (
-                    nixl_agent_meta.kv_caches_base_addr[region_index],
-                    remote_block_len,
-                    device_id,
-                    remote_block_stride,
-                    num_blocks,
-                )
+                (addr, remote_block_len, device_id, remote_block_stride, num_blocks)
             )
 
         return self._pack_strided_descs(strided_descs)
@@ -2035,21 +2020,10 @@ class NixlBaseConnectorWorker:
         return strided_descs
 
     @staticmethod
-    def _strided_desc_is_dram(
-        desc_is_dram: np.ndarray, strided_descs: np.ndarray
-    ) -> np.ndarray:
-        """Per-strided-desc DRAM flags from per-block ones. A strided desc never
-        spans regions, so its first block decides."""
+    def _strided_desc_starts(strided_descs: np.ndarray) -> np.ndarray:
+        """Flat block index of each strided desc's first block."""
         counts = strided_descs[:, 4]
-        return desc_is_dram[np.cumsum(counts) - counts]
-
-    def _prep_xfer_dlist(
-        self, agent_name: str, strided_descs: np.ndarray, mem_type: str
-    ) -> int:
-        """Prepare a NIXL dlist handle from Nx5 strided descs."""
-        return self.nixl_wrapper.prep_xfer_dlist(
-            agent_name, strided_descs, mem_type=mem_type
-        )
+        return np.cumsum(counts) - counts
 
     def _build_fa_local(
         self,
@@ -2189,24 +2163,29 @@ class NixlBaseConnectorWorker:
             self._desc_is_dram_by_block_size[block_size] = desc_is_dram
             self._desc_pos_by_block_size[block_size] = desc_pos
             # DRAM descriptors are registered under CPU device 0.
-            strided_is_dram = self._strided_desc_is_dram(desc_is_dram, blocks_data)
+            # A strided desc never spans regions, so its first block decides.
+            strided_is_dram = desc_is_dram[self._strided_desc_starts(blocks_data)]
             blocks_data[strided_is_dram, 2] = 0
             if self._skip_dram_xfer:
                 self._dram_src_handles_by_block_size[block_size] = None
             else:
                 self._dram_src_handles_by_block_size[block_size] = (
-                    self._prep_xfer_dlist(
-                        "NIXL_INIT_AGENT", blocks_data[strided_is_dram], "DRAM"
+                    self.nixl_wrapper.prep_xfer_dlist(
+                        "NIXL_INIT_AGENT",
+                        blocks_data[strided_is_dram],
+                        mem_type="DRAM",
                     )
                 )
-            device_handle = self._prep_xfer_dlist(
-                "NIXL_INIT_AGENT", blocks_data[~strided_is_dram], self.nixl_memory_type
+            device_handle = self.nixl_wrapper.prep_xfer_dlist(
+                "NIXL_INIT_AGENT",
+                blocks_data[~strided_is_dram],
+                mem_type=self.nixl_memory_type,
             )
             return device_handle, blocks_data
 
         # NIXL_INIT_AGENT to be used for preparations of local descs.
-        handle = self._prep_xfer_dlist(
-            "NIXL_INIT_AGENT", blocks_data, self.region_mem_types[0]
+        handle = self.nixl_wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", blocks_data, mem_type=self.region_mem_types[0]
         )
         return handle, blocks_data
 
@@ -2426,19 +2405,21 @@ class NixlBaseConnectorWorker:
             ):
                 if self._mixed_mem_types:
                     desc_is_dram = self._desc_is_dram_by_block_size[remote_block_size]
-                    strided_is_dram = self._strided_desc_is_dram(
-                        desc_is_dram, handle_data
-                    )
+                    strided_is_dram = desc_is_dram[
+                        self._strided_desc_starts(handle_data)
+                    ]
                     if self._skip_dram_xfer:
                         dram_handle = None
                     else:
-                        dram_handle = self._prep_xfer_dlist(
-                            "NIXL_INIT_AGENT", handle_data[strided_is_dram], "DRAM"
+                        dram_handle = self.nixl_wrapper.prep_xfer_dlist(
+                            "NIXL_INIT_AGENT",
+                            handle_data[strided_is_dram],
+                            mem_type="DRAM",
                         )
                     self._dram_src_handles_by_tp_ratio[split_key].append(dram_handle)
                     handle_data = handle_data[~strided_is_dram]
-                handle = self._prep_xfer_dlist(
-                    "NIXL_INIT_AGENT", handle_data, self.nixl_memory_type
+                handle = self.nixl_wrapper.prep_xfer_dlist(
+                    "NIXL_INIT_AGENT", handle_data, mem_type=self.nixl_memory_type
                 )
                 self.src_xfer_handles_by_tp_ratio[split_key].append(handle)
 
@@ -2475,8 +2456,10 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL pull does not yet support a mixed-memory producer"
             )
-        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = self._prep_xfer_dlist(
-            remote_agent_name, blocks_data, remote_mem_types.pop()
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+            self.nixl_wrapper.prep_xfer_dlist(
+                remote_agent_name, blocks_data, mem_type=remote_mem_types.pop()
+            )
         )
 
         return remote_agent_name
