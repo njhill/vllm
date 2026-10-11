@@ -382,7 +382,7 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/vllm/v1 /vllm_v1
 
 # NIXL/UCX build stages
 FROM base AS build_nixl
-ARG NIXL_BRANCH="231d56753047c989062a5cb2ac703a1ad761c7d2"
+ARG NIXL_BRANCH="1683cf3b7f3d11674c03c5e861cea22339876c96"
 ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 ARG UCX_BRANCH="96e58a16039f6d7d213bc967b8069238742c5194"
 ARG UCX_REPO="https://github.com/openucx/ucx.git"
