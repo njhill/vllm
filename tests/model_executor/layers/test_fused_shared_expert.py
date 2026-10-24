@@ -945,6 +945,8 @@ def test_models_fse_init(
                 vllm_config.speculative_config = SimpleNamespace(
                     draft_model_config=SimpleNamespace(hf_config=config),
                     method="mtp",
+                    base_method="mtp",
+                    speculator_config=SimpleNamespace(speculator_class="MTP"),
                     parallel_drafting=False,
                     enable_adaptive_verification=False,
                     use_dspark=lambda: False,
