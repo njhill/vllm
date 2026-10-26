@@ -248,7 +248,7 @@ class KVCacheManager:
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
-        return self.enable_caching and not request.skip_reading_prefix_cache
+        return self.enable_caching and request.prefix_cache_hit_limit != 0
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
@@ -270,7 +270,7 @@ class KVCacheManager:
         Args:
             request: The request to get the computed blocks.
             max_cache_hit_length: Upper bound on the hit length. Defaults to
-                ``request.max_cache_hit_length``; explicit bounds can only
+                ``request.get_max_cache_hit_length()``; explicit bounds can only
                 reduce the request's cache hit limit.
 
         Returns:
@@ -297,12 +297,7 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        if max_cache_hit_length is None:
-            max_cache_hit_length = request.max_cache_hit_length
-        else:
-            max_cache_hit_length = min(
-                max_cache_hit_length, request.max_cache_hit_length
-            )
+        max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -363,12 +358,7 @@ class KVCacheManager:
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
 
-        if max_cache_hit_length is None:
-            max_cache_hit_length = request.max_cache_hit_length
-        else:
-            max_cache_hit_length = min(
-                max_cache_hit_length, request.max_cache_hit_length
-            )
+        max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, max_cache_hit_length
