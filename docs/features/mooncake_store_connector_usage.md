@@ -14,8 +14,10 @@ MooncakeStoreConnector is a KV cache connector that uses [MooncakeDistributedSto
 Install mooncake through pip:
 
 ```bash
-uv pip install mooncake-transfer-engine
+uv pip install mooncake-transfer-engine-cuda13
 ```
+
+vLLM defaults to CUDA 13. On a CUDA 12 environment install `mooncake-transfer-engine` instead. The wrong one fails to import with `libcudart.so.<major>: cannot open shared object file`.
 
 Refer to the [Mooncake official repository](https://github.com/kvcache-ai/Mooncake) for more installation instructions and building from source.
 

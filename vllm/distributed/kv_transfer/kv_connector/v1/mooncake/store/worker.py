@@ -2055,14 +2055,11 @@ class MooncakeStoreWorker:
                 region_len = cache_storage.nbytes()
                 ret = self.store.register_buffer(base_addr, region_len)
                 if ret != 0:
-                    logger.error(
-                        "register_buffer failed for addr %#x len %d: %d",
-                        base_addr,
-                        region_len,
-                        ret,
+                    raise RuntimeError(
+                        "Mooncake register_buffer failed for addr "
+                        f"{base_addr:#x} len {region_len}: {ret}"
                     )
-                else:
-                    self._device_regions[base_addr] = region_len
+                self._device_regions[base_addr] = region_len
             for group_id, (group, db) in enumerate(
                 zip(self._kv_cache_groups, self.token_dbs, strict=True)
             ):

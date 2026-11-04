@@ -5596,7 +5596,8 @@ def test_register_kv_caches_excludes_nonprefix_cacheable_layers():
 
 def test_register_kv_caches_uses_committed_block_count():
     """An extensible KV cache creates the connector with its committed block
-    count while cache_config.num_gpu_blocks still holds the warmup size."""
+    count while a worker process's cache_config.num_gpu_blocks still holds the
+    reserved capacity."""
     num_blocks = 6
     worker = _make_bare_worker(num_gpu_blocks=num_blocks)
     worker.cache_config.num_gpu_blocks = 16
@@ -5614,6 +5615,19 @@ def test_register_kv_caches_uses_committed_block_count():
     worker.store.register_buffer.assert_called_once_with(
         cache.data_ptr(), cache.untyped_storage().nbytes()
     )
+
+
+def test_register_kv_caches_raises_on_failed_registration():
+    """Transfers to an unregistered cache all fail, disabling the connector."""
+    num_blocks = 6
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    worker.store.register_buffer.return_value = -1
+    cache = torch.zeros(num_blocks, 4, dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="register_buffer failed"):
+        worker.register_kv_caches({"layer0": cache})
+
+    assert worker._device_regions == {}
 
 
 def test_register_kv_caches_separate_head_groups():
