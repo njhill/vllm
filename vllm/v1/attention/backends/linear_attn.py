@@ -33,7 +33,7 @@ class LinearAttentionBackend(AttentionBackend):
         return True
 
 
-@dataclass
+@dataclass(slots=True)
 class LinearAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
@@ -104,7 +104,7 @@ class BailingLinearAttentionBackend(LinearAttentionBackend):
         return BailingLinearAttentionMetadataBuilder
 
 
-@dataclass
+@dataclass(slots=True)
 class BailingLinearAttentionMetadata(LinearAttentionMetadata):
     state_indices_tensor_d: torch.Tensor | None = None
     state_indices_tensor_p: torch.Tensor | None = None

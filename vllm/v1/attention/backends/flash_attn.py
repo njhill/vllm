@@ -97,7 +97,7 @@ FA4_DENSE_MAX_SEQLEN_K = 8192
 class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"]):
     """Warm paged, causal FA4 on Blackwell and Hopper."""
 
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         q_stage: int
         dtype: torch.dtype
@@ -514,7 +514,7 @@ class FlashAttentionBackend(AttentionBackend):
         return None
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|

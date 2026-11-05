@@ -29,7 +29,7 @@ def _schema_fingerprint(parts: tuple[object, ...]) -> str:
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
 
 
-@dataclass
+@dataclass(slots=True)
 class KeyMetadata:
     """Metadata for constructing pool keys."""
 
@@ -48,7 +48,7 @@ class KeyMetadata:
     store_namespace: str = ""
 
 
-@dataclass(order=True)
+@dataclass(order=True, slots=True)
 class PoolKey:
     """Key for addressing KV cache blocks in the distributed store."""
 

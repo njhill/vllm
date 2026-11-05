@@ -17,7 +17,7 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
-@dataclass
+@dataclass(slots=True)
 class UBatchSlice:
     request_slice: slice
     token_slice: slice

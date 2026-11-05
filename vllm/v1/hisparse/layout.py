@@ -36,7 +36,7 @@ HISPARSE_HOT_SUFFIX = ".hisparse_hot"
 HISPARSE_RESIDENT_SUFFIX = ".hisparse_resident"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HiSparseLayout:
     source_group: KVCacheGroupSpec
     device_groups: list[KVCacheGroupSpec]

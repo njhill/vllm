@@ -97,7 +97,7 @@ class FusedMoEActivationFormat(Enum):
     BatchedExperts = ("batched_experts",)
 
 
-@dataclass
+@dataclass(slots=True)
 class ExpertTokensMetadata:
     """Metadata regarding expert-token routing."""
 

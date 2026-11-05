@@ -330,7 +330,7 @@ class SchedulerOffloadConfig(NamedTuple):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestGroupState:
     offload_keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
@@ -554,7 +554,7 @@ class _RequestTokens(NamedTuple):
     num_tokens: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _VllmReqContext(ReqContext):
     _scheduler: "OffloadingConnectorScheduler" = field(
         kw_only=True, repr=False, compare=False

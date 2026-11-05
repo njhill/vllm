@@ -41,7 +41,7 @@ BudgetGraphMapKey: TypeAlias = int | tuple[int, CaptureAxisKeys]
 _CAPTURE_GRAPH_COUNT_WARNING_THRESHOLD = 64
 
 
-@dataclass
+@dataclass(slots=True)
 class BudgetGraphMetadata:
     """Metadata for a single budget graph.
 

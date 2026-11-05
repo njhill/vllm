@@ -109,7 +109,7 @@ def _model_fingerprint(model_config: Any) -> dict[str, Any]:
     }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RankTopology:
     """Model-parallel ranks that participate in one KV object."""
 
@@ -187,7 +187,7 @@ class RankTopology:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UMBPNamespace:
     """Compatibility namespace for objects stored outside the engine."""
 
@@ -272,7 +272,7 @@ class UMBPHandshakeMetadata(KVConnectorHandshakeMetadata):
     namespace: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BlockIdentityCodec:
     """Build stable rank-local keys from vLLM block hashes."""
 
@@ -320,7 +320,7 @@ class BlockIdentityCodec:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KVRegion:
     """One deterministic region in a rank-local KV object."""
 
@@ -350,7 +350,7 @@ class KVRegion:
             )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KVLayoutDescriptor:
     """Backend-neutral description of one rank-local KV object layout."""
 
@@ -624,7 +624,7 @@ class KVRange(NamedTuple):
     object_offset: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BlockTransferPlan:
     """One complete logical block transfer."""
 
@@ -732,7 +732,7 @@ class BlockStoreBatch(Sequence[BlockTransferPlan]):
         return replace(self, keys=keys)
 
 
-@dataclass
+@dataclass(slots=True)
 class LoadSpec:
     """Scheduler decision for one externally loaded prefix."""
 
@@ -746,7 +746,7 @@ class LoadSpec:
         return max(self.external_tokens - self.local_tokens, 0)
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestTracker:
     """Core request state shared by every runtime mode."""
 
@@ -799,7 +799,7 @@ class TransferJobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-@dataclass
+@dataclass(slots=True)
 class TransferJobState:
     """Per-key completion state; one failed key does not fail its siblings."""
 
@@ -897,7 +897,7 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
         yield from self.store_requests.values()
 
 
-@dataclass
+@dataclass(slots=True)
 class StoreEventResult:
     """Number of workers that finished one store event."""
 

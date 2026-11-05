@@ -209,7 +209,7 @@ class CachedRequestData:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class ScheduledEncoderInputStats:
     """Stats for encoder inputs scheduled in one iteration."""
 
@@ -217,7 +217,7 @@ class ScheduledEncoderInputStats:
     output_tokens: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class KVConnectorBlockState:
     """Scheduler-local block state offered to a producer-side KV connector."""
 
@@ -340,7 +340,7 @@ class SchedulerOutput:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class GrammarOutput:
     # ids of structured output requests.
     structured_output_request_ids: list[str]

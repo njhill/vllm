@@ -114,7 +114,7 @@ class Mamba2AttentionBackend(AttentionBackend):
         return not vllm_config.cache_config.use_replayssm
 
 
-@dataclass
+@dataclass(slots=True)
 class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     prep_initial_states: bool = False
     chunk_size: int = 0

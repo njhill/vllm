@@ -6,7 +6,7 @@ by ``additional_config={"decode_backend": "latency_specialized"}``."""
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DecodeConfig:
     max_context: int
     mla_core: str

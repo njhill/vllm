@@ -46,7 +46,7 @@ class ShortConvAttentionBackend(AttentionBackend):
         return True
 
 
-@dataclass
+@dataclass(slots=True)
 class ShortConvAttentionMetadata(BaseMambaAttentionMetadata):
     pass
 
@@ -57,7 +57,7 @@ class ShortConvAttentionMetadataBuilder(
     metadata_cls = ShortConvAttentionMetadata
 
 
-@dataclass
+@dataclass(slots=True)
 class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     # Number of speculative-decode (multi-query / MTP) requests and the total
     # number of tokens they contribute. These are 0 when spec-decode is off.

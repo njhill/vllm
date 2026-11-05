@@ -18,7 +18,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class BenchBatch:
     scheduler_output: SchedulerOutput
     # req_id -> token IDs of the query tokens, in order.

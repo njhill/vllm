@@ -56,7 +56,7 @@ class CompressorBackend(AttentionBackend):
         return CompressorMetadataBuilder
 
 
-@dataclass
+@dataclass(slots=True)
 class CompressorMetadata:
     # [num_tokens] ring slot of every token: block * capacity + pos % capacity.
     slot_mapping: torch.Tensor

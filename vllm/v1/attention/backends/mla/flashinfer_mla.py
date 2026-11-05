@@ -117,7 +117,7 @@ def _get_multi_ctas_kv_counter_buffer(
     return _fi_multi_ctas_kv_counter
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashInferMLADecodeMetadata(MLACommonDecodeMetadata):
     flattened_block_table: torch.Tensor | None = None
     flattened_seq_lens: torch.Tensor | None = None

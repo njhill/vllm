@@ -75,7 +75,7 @@ if TRTLLM_GEN_MXFP8_AVAILABLE:
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class ModelCase:
     model_id: str
     tp: int

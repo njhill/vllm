@@ -45,7 +45,7 @@ def _cat_ubatch_outputs(
     return torch.cat(sorted_results, dim=0)
 
 
-@dataclass
+@dataclass(slots=True)
 class UbatchMetadata:
     context: UBatchContext
     input_ids: torch.Tensor
@@ -55,7 +55,7 @@ class UbatchMetadata:
     num_tokens: int
 
 
-@dataclass
+@dataclass(slots=True)
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
     ubatch_metadata: UbatchMetadata

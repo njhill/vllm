@@ -197,7 +197,7 @@ async def get_first_model_from_server(
             ) from e
 
 
-@dataclass
+@dataclass(slots=True)
 class SpecDecodeMetrics:
     """Speculative decoding metrics from the server's Prometheus endpoint."""
 
@@ -271,7 +271,7 @@ async def fetch_spec_decode_metrics(
         return None
 
 
-@dataclass
+@dataclass(slots=True)
 class DiffusionMetrics:
     """Diffusion (dLLM) decoding metrics from the server's Prometheus endpoint."""
 
@@ -338,7 +338,7 @@ class TaskType(Enum):
     POOLING = "pooling"
 
 
-@dataclass
+@dataclass(slots=True)
 class BenchmarkMetrics:
     completed: int
     failed: int
@@ -373,7 +373,7 @@ class BenchmarkMetrics:
     rtfx: float = 0.0  # Inverse Real-Time Factor for ASR benchmarks
 
 
-@dataclass
+@dataclass(slots=True)
 class EmbedBenchmarkMetrics:
     completed: int
     failed: int

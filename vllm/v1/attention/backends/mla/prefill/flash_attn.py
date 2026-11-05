@@ -60,7 +60,7 @@ FA4_MLA_PREFILL_LSE_OPTIONS = (False, True)
 class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
     """FA4 MLA prefill compile-key wrapper used by generic JIT warmup."""
 
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         """High-level FA4 compile-only key used by vLLM warmup.
 

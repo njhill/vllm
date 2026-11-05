@@ -32,7 +32,7 @@ class MockSchedulerOutput:
         self.num_scheduled_tokens = num_scheduled_tokens
 
 
-@dataclass
+@dataclass(slots=True)
 class ReorderTestCase:
     # (num_scheduled_tokens, num_computed_tokens, num_prompt_tokens)
     requests: list[tuple[int, int, int]]

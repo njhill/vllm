@@ -191,7 +191,7 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
 # -----------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class _TestConfig:
     """Common test configuration for fused kernel tests."""
 

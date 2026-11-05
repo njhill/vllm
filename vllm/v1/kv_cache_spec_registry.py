@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KVCacheSpecMetadata:
     """Metadata for a registered KVCacheSpec."""
 

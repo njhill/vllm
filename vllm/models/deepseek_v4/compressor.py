@@ -78,7 +78,7 @@ class CompressorBackend(AttentionBackend):
         return CompressorMetadataBuilder
 
 
-@dataclass
+@dataclass(slots=True)
 class CompressorMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor

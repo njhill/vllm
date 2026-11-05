@@ -582,7 +582,7 @@ def _commit_kda_state_kernel(
     tl.store(final_ptrs, state, mask=mask_state)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KDARecoverSSMRecords:
     """One KDA layer's RecoverSSM verify records.
 
@@ -739,7 +739,7 @@ def kda_recoverssm_verify(
     return out
 
 
-@dataclass
+@dataclass(slots=True)
 class KDARecoverSSMCommitContext:
     conv_states: tuple[torch.Tensor, ...]
     conv_state_base_addrs: torch.Tensor

@@ -24,7 +24,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 logger = init_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class TransferMetadata:
     """Metadata describing a completed EPLB buffer transfer."""
 
@@ -42,7 +42,7 @@ class TransferMetadata:
     """Target expert indices (num_local_experts,) in local tensors to send."""
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncEplbLayerResult:
     """The result of one completed async EPLB layer transfer."""
 

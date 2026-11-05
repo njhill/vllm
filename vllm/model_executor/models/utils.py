@@ -54,7 +54,7 @@ WeightsTransformFn: TypeAlias = Callable[
 unrecognized tensors through unchanged."""
 
 
-@dataclass
+@dataclass(slots=True)
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
 

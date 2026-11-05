@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
@@ -74,7 +74,7 @@ class AttentionCGSupportInfo:
         return self
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FastPrefillBatchMetadata:
     """Per-step inputs for the KV-sharing fast prefill path."""
 

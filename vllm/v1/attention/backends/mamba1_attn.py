@@ -25,7 +25,7 @@ class Mamba1AttentionBackend(AttentionBackend):
         return True
 
 
-@dataclass
+@dataclass(slots=True)
 class Mamba1AttentionMetadata(BaseMambaAttentionMetadata):
     pass
 

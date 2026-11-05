@@ -11,7 +11,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PLEShardOverlap:
     """Source and destination slices for one checkpoint embedding shard."""
 

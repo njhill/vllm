@@ -47,7 +47,7 @@ from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_gemm
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Geometry:
     name: str
     hidden_size: int

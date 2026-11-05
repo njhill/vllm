@@ -24,7 +24,7 @@ _TRANSFORMERS_LEGACY_MODULES = (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class ForbiddenImport:
     pattern: str
     tip: str

@@ -114,7 +114,7 @@ def build_spec_decoding_metrics(
     return SpeculativeDecodingMetrics(**metrics.to_dict())
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, slots=True)
 class ServeContext(Generic[RequestT]):
     request: RequestT
     raw_request: Request | None = None

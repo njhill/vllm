@@ -109,7 +109,7 @@ class XPUFlashAttnMLABackend(FlashAttnMLABackend):
         return [576]
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashAttnMLADecodeMetadata(MLACommonDecodeMetadata):
     query_start_loc: torch.Tensor
     max_query_len: int

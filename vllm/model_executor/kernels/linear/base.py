@@ -10,11 +10,11 @@ import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 
 
-@dataclass
+@dataclass(slots=True)
 class MMLinearLayerConfig: ...
 
 
-@dataclass
+@dataclass(slots=True)
 class Params:
     """Base class for quantized layer parameters.
 
@@ -70,7 +70,7 @@ class Params:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class FP8Params(Params):
     """FP8 layer parameters with typed fields."""
 

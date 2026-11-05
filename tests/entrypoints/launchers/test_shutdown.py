@@ -67,7 +67,7 @@ async def _assert_children_cleaned_up(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class ShutdownState:
     got_503: bool = False
     got_500: bool = False

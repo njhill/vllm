@@ -742,7 +742,7 @@ def validate_mamba_state_copy_funcs(
         )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class MambaCopyBuffers:
     src_ptrs: CpuGpuBuffer
     dst_ptrs: CpuGpuBuffer
@@ -811,7 +811,7 @@ def _get_mamba_gpu_state_copy_funcs(
     return state_copy_funcs
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class MambaSpecDecodeGPUContext:
     """Context for GPU-side Mamba state copy operations during the
     fused postprocess path.
@@ -1394,7 +1394,7 @@ class MambaSpecDecodeGPUContext:
         )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class MambaBuffers:
     """Single owner for all mamba-specific runner buffers.
 

@@ -157,7 +157,7 @@ class RocmOctaveAttentionBackend(AttentionBackend):
         return replace(spec, state_content_bytes=fmt.slot_bytes)
 
 
-@dataclass
+@dataclass(slots=True)
 class RocmOctaveMetadata:
     num_actual_tokens: int
     max_query_len: int

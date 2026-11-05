@@ -32,7 +32,7 @@ from .stats import UMBPStoreConnectorStats
 logger = init_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class _StoreBatch:
     event_id: int
     jobs: dict[str, TransferJobState]

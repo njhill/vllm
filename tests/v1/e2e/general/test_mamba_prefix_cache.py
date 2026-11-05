@@ -39,7 +39,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.mamba_utils import get_mamba_groups
 
 
-@dataclass
+@dataclass(slots=True)
 class StepAction:
     num_computed_tokens_start: int
     num_scheduled_tokens: int
@@ -529,7 +529,7 @@ def check_mamba_state_equal(
     return True
 
 
-@dataclass
+@dataclass(slots=True)
 class TestConfig:
     num_prompt_tokens: int
     num_generated_tokens: int

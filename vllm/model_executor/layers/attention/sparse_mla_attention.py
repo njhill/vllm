@@ -144,7 +144,7 @@ def _use_dense_mha_prefill(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class SparseMLAPrefillMetadata(MLACommonPrefillMetadata):
     host_staging_plan: HiSparsePrefillStagingPlan | None = None
 

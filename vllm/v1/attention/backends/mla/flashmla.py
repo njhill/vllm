@@ -96,7 +96,7 @@ class FlashMLABackend(MLACommonBackend):
             return is_flashmla_dense_supported()[1]
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashMLADecodeMetadata(MLACommonDecodeMetadata):
     scheduler_metadata: FlashMLASchedMeta
 

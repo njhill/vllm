@@ -56,7 +56,7 @@ class _DMADescriptors(NamedTuple):
     sizes_np: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class _SlotMappingStaging:
     stream: torch.Stream
     event: torch.Event

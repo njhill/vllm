@@ -1477,7 +1477,7 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
     return None
 
 
-@dataclass
+@dataclass(slots=True)
 class KVCacheTensor:
     """A class for specifying how the workers should initialize the KV cache.
 
@@ -1507,7 +1507,7 @@ class KVCacheGroupRole(str, Enum):
     HISPARSE_INDEXER = "hisparse_indexer"
 
 
-@dataclass
+@dataclass(slots=True)
 class KVCacheGroupSpec:
     """Represents a group of model layers that share the same KV cache block table.
     These layers are regarded as one layer in the KV cache manager.

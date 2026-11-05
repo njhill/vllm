@@ -39,7 +39,7 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MegaMoEActivation:
     """Gated activation fused into the MegaMoE L1 epilogue.
 
@@ -82,7 +82,7 @@ class MegaMoEActivation:
         return kwargs
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MegaMoEWeightSpec:
     """Storage of one MegaMoE weight in the kernel layout."""
 
@@ -118,7 +118,7 @@ _NVFP4_WEIGHT = MegaMoEWeightSpec(
 _BF16_WEIGHT = MegaMoEWeightSpec(torch.bfloat16)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MegaMoEWeightFormat:
     """One routed-expert precision of the MegaMoE feature matrix."""
 

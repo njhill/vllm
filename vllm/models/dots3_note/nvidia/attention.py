@@ -171,12 +171,12 @@ def _apply_swa_score_mask_kernel(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class Dots3NoteDecodeMetadata(MLACommonDecodeMetadata):
     query_len: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _SlidingWindowChunk:
     req_start: int
     req_end: int
@@ -191,7 +191,7 @@ class _SlidingWindowChunk:
     max_seq_len_k: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _SlidingWindowMetadata:
     chunks: list[_SlidingWindowChunk]
     workspace: torch.Tensor

@@ -741,14 +741,14 @@ class FlashInferBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
 
 
-@dataclass
+@dataclass(slots=True)
 class FIDecode:
     """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
 
@@ -766,7 +766,7 @@ def _is_xqa_head_dim_supported(head_dim: int) -> bool:
     return 16 <= head_dim <= 256 and head_dim % 16 == 0
 
 
-@dataclass
+@dataclass(slots=True)
 class TRTLLMPrefill:
     """Metadata for the TRTLLM prefill pathway."""
 
@@ -794,7 +794,7 @@ class TRTLLMPrefill:
     """The maximum sequence length for KV Cache."""
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashInferTrtllmAPIDecode:
     """Metadata for XQA and trtllm-gen decode."""
 
@@ -828,7 +828,7 @@ class FlashInferTrtllmAPIDecode:
     """Decode query boundaries for masking empty DCP shards during reduction."""
 
 
-@dataclass
+@dataclass(slots=True)
 class FlashInferMetadata:
     kv_cache_layout: KVCacheLayout
     num_actual_tokens: int

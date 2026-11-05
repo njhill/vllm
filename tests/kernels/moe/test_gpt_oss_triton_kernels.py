@@ -272,7 +272,7 @@ def oai_moe_forward(
     return t
 
 
-@dataclass
+@dataclass(slots=True)
 class Case:
     a_dtype: str
     w_dtype: str

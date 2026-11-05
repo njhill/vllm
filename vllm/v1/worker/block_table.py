@@ -307,7 +307,7 @@ class ComputeSlotMappingKernel(
 ):
     triton_block_size = 1024
 
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         kv_cache_block_size: int
         total_cp_world_size: int

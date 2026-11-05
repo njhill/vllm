@@ -35,7 +35,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class SparseMQARowsMetadata:
     """Per-row state for one sparse-logits call: the decode rows, or one
     prefill chunk. Buffers are builder-owned views sized to the rows.
@@ -62,7 +62,7 @@ class SparseMQARowsMetadata:
     kernel_metadata: torch.Tensor | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class DeepseekV41SparseIndexerMetadata(DeepseekV32IndexerMetadata):
     sparse_block_kv: int = 0
     sparse_decode: SparseMQARowsMetadata | None = None

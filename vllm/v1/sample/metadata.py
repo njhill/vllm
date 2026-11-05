@@ -11,7 +11,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
 
-@dataclass
+@dataclass(slots=True)
 class SamplingMetadata:
     temperature: torch.Tensor | None
     all_greedy: bool

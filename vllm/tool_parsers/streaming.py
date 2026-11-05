@@ -63,7 +63,7 @@ def extract_named_tool_call_streaming(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class _RequiredToolCallSpan:
     """Where one element of a ``tool_choice="required"`` array sits in the text.
 

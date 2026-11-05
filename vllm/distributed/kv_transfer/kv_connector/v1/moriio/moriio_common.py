@@ -61,7 +61,7 @@ class MoRIIOTransferAck(NamedTuple):
     consumer_tp_size: int = 1
 
 
-@dataclass
+@dataclass(slots=True)
 class WriteTask:
     request_id: ReqId
     transfer_id: TransferId
@@ -83,7 +83,7 @@ class WriteTask:
     retried: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class LayerTransferPlan:
     """Plan for transferring a single layer."""
 
@@ -97,7 +97,7 @@ class LayerTransferPlan:
     use_batch: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class RemoteAllocInfo:
     """Information about remote block allocation."""
 
@@ -288,7 +288,7 @@ def _warn_deprecated_env_vars() -> None:
             )
 
 
-@dataclass
+@dataclass(slots=True)
 class MoRIIOConfig:
     local_ip: str
     local_kv_port: int
@@ -508,7 +508,7 @@ def get_peer_zmq_from_request_id(request_id: str, is_producer: bool) -> str | No
     return m.group(1)
 
 
-@dataclass
+@dataclass(slots=True)
 class ReqMeta:
     """Metadata for a single request."""
 

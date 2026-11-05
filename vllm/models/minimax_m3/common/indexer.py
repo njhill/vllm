@@ -168,7 +168,7 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         return self.backend_cls
 
 
-@dataclass
+@dataclass(slots=True)
 class MiniMaxM3IndexerPrefillMetadata:
     """Per-prefill index-scoring state."""
 
@@ -180,7 +180,7 @@ class MiniMaxM3IndexerPrefillMetadata:
     max_seq_len: int
 
 
-@dataclass
+@dataclass(slots=True)
 class MiniMaxM3IndexerDecodeMetadata:
     """Per-decode state (cudagraph-safe). ``decode_query_len`` is the uniform
     per-request query length (1, or 1 + num_speculative_tokens)."""

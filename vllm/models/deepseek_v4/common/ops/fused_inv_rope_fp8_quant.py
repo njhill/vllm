@@ -25,7 +25,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 class FusedInvRopeFP8QuantKernel(
     VllmTritonJitKernel["FusedInvRopeFP8QuantKernel.CompileKey"]
 ):
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         heads_per_group: int
         fp8_max: float

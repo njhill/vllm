@@ -53,7 +53,7 @@ class TimedRegion(str, Enum):
     BOTH = "both"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Case:
     kernel: str
     output_width: int

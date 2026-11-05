@@ -106,7 +106,7 @@ MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _StoreGroupPlan:
     layer_specs: tuple[KVCacheSpec, ...]
     local_block_size: int

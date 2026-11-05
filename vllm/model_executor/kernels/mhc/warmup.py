@@ -22,7 +22,7 @@ def compute_mhc_pre_num_splits(input_size: int, num_tokens: int) -> int:
 
 
 class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         hidden_size: int
         rms_eps: float

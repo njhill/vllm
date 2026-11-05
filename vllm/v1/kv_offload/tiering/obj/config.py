@@ -5,7 +5,7 @@
 from dataclasses import dataclass, field
 
 
-@dataclass
+@dataclass(slots=True)
 class ObjStoreConfig:
     """Connection parameters for an object store backend.
 

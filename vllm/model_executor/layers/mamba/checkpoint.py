@@ -71,7 +71,7 @@ def _gather_checkpoint_state_indices(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class MambaPrefillCheckpointMetadata:
     checkpoint_offsets: torch.Tensor
     state_indices: torch.Tensor

@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class _Chunk:
     """One packed pull plus its post-processing (see Data flow).
 
@@ -113,7 +113,7 @@ class _Chunk:
     seq: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class _CallPlan:
     """The static plan for one sync (see Data flow). Pure, so it is built once
     and reused; runtime is then execution only.
@@ -128,7 +128,7 @@ class _CallPlan:
     pre_free: "list[int]"
 
 
-@dataclass
+@dataclass(slots=True)
 class _PendingPull:
     """A dispatched pull whose blocking ``ray.get`` has not run (see Data flow).
 
@@ -143,7 +143,7 @@ class _PendingPull:
     slot: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _ProcItem:
     """A landed pull handed to the background scatter thread (see Data flow).
 

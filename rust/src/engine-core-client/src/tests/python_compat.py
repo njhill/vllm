@@ -108,7 +108,7 @@ class EngineCoreRequest(
     block_hashes: list[bytes] | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RequestError:
     code: str
     message: str
@@ -498,7 +498,7 @@ multipart_prompt_logprobs = engine_outputs_wire(
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class KVEventsConfig:
     enable_kv_cache_events: bool
     publisher: str
@@ -510,7 +510,7 @@ class KVEventsConfig:
     topic: str
 
 
-@dataclass
+@dataclass(slots=True)
 class PrefixHashConfig:
     hash_algo: str
     hash_block_size: int
@@ -518,7 +518,7 @@ class PrefixHashConfig:
     num_lookahead_tokens: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class EngineCoreReadyResponse:
     max_model_len: int
     num_gpu_blocks: int

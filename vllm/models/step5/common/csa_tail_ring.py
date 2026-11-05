@@ -38,7 +38,7 @@ def _minimum_tail_ring_block_size(
     return _TAIL_RING_BLOCK_SIZES[-1]
 
 
-@dataclass
+@dataclass(slots=True)
 class Step5CSATailRingMetadata:
     # [num_tokens] first ring row of the token's request block, or -1.
     base: torch.Tensor
