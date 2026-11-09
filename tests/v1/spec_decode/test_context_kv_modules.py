@@ -14,7 +14,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import supports_context_kv_only
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 
@@ -103,16 +102,3 @@ def test_freeing_keeps_context_kv(dist_init, monkeypatch, target, draft, method,
 
     assert len(before) == len(after) == 2 * len(attn_layers)
     assert all(torch.equal(b, a) for b, a in zip(before, after))
-
-
-def test_opt_in_is_per_class():
-    # A subclass's context K/V path may read other weights.
-    class Draft:
-        def context_kv_modules(self) -> list[nn.Module]:
-            return []
-
-    class Subclass(Draft):
-        pass
-
-    assert supports_context_kv_only(Draft())
-    assert not supports_context_kv_only(Subclass())

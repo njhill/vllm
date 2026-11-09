@@ -400,10 +400,6 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     model_cls = MiniMaxM3DSparkModel
 
-    def context_kv_modules(self) -> list[nn.Module]:
-        """See `SupportsContextKVOnly`."""
-        return self.model.context_kv_modules()
-
     @staticmethod
     def _rename_checkpoint_weights(
         weights: Iterable[tuple[str, torch.Tensor]],

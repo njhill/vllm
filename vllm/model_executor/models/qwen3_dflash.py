@@ -975,7 +975,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
 
     def context_kv_modules(self) -> list[nn.Module]:
-        """See `SupportsContextKVOnly`."""
+        """The modules whose weights `combine_hidden_states` and
+        `precompute_and_store_context_kv` read once loaded. With
+        `SpeculativeConfig.prefill_context_kv_only`, the other draft weights
+        are freed (see `DFlashSpeculator.free_unused_weights`)."""
         return self.model.context_kv_modules()
 
     def combine_hidden_states(

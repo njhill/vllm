@@ -551,10 +551,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
             out = gather_columns(out.view(-1, out.shape[-1])).view(*out.shape[:-1], -1)
         return out
 
-    def context_kv_modules(self) -> list[nn.Module]:
-        """See `SupportsContextKVOnly`."""
-        return self.model.context_kv_modules()
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         model_weights = {}
         includes_lm_head = False

@@ -10,7 +10,6 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import supports_context_kv_only
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -258,19 +257,17 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def free_unused_weights(self, target_model: nn.Module) -> None:
         """With context_kv_only, keep only the weights of the modules that store
-        the context K/V and those shared with the target, for a draft model that
-        opts in (see `SupportsContextKVOnly`). Others keep all of their weights."""
-        if not self.context_kv_only:
+        the context K/V and those shared with the target. A draft model without
+        `context_kv_modules` keeps all of its weights."""
+        if not self.context_kv_only or not hasattr(self.model, "context_kv_modules"):
             return
+        keep = {id(p) for m in self.model.context_kv_modules() for p in m.parameters()}
+        keep.update(id(p) for p in target_model.parameters())
         freed_bytes = 0
-        if supports_context_kv_only(self.model):
-            modules = self.model.context_kv_modules()
-            keep = {id(p) for m in modules for p in m.parameters()}
-            keep.update(id(p) for p in target_model.parameters())
-            for param in self.model.parameters():
-                if id(param) not in keep:
-                    freed_bytes += param.nbytes
-                    param.data = param.data.new_empty(0)
+        for param in self.model.parameters():
+            if id(param) not in keep:
+                freed_bytes += param.nbytes
+                param.data = param.data.new_empty(0)
         logger.info(
             "%s drafter only stores its context K/V (prefill_context_kv_only); "
             "freed %.2f GiB of its weights.",
