@@ -219,6 +219,9 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        # A step whose sampling waits until all earlier steps' outputs have been
+        # processed (see step_with_batch_queue), with its execute_model future.
+        self.deferred_step: tuple[SchedulerOutput, Future[Any]] | None = None
 
         self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
@@ -737,8 +740,9 @@ class EngineCore:
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
-        deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # While a deferred step waits to be sampled, nothing else can be
+        # scheduled: workers must receive its sample_tokens() call first.
+        if self.deferred_step is None and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -761,11 +765,11 @@ class EngineCore:
                         grammar_output, non_block=True
                     )
                 else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                    # We need to defer sampling until we have processed the model
+                    # outputs from the prior steps.
+                    self.deferred_step = (scheduler_output, exec_future)
 
-            if not deferred_scheduler_output:
+            if self.deferred_step is None:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if len(batch_queue) < self.batch_queue_size and (
@@ -806,7 +810,18 @@ class EngineCore:
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
-        if deferred_scheduler_output:
+        # The deferred step's grammars must include the tokens of every prior
+        # step of its requests. With more than one prior step in flight (async
+        # scheduling depth > 2), the oldest may not be the only one, so it stays
+        # deferred across calls until no queued step shares a request with it.
+        if self.deferred_step is not None and not any(
+            not so.num_scheduled_tokens.keys().isdisjoint(
+                self.deferred_step[0].num_scheduled_tokens
+            )
+            for _, so, _ in batch_queue
+        ):
+            deferred_scheduler_output, exec_future = self.deferred_step
+            self.deferred_step = None
             # Update the deferred scheduler output before computing its grammar
             # bitmask.
             if self.check_for_draft_tokens:

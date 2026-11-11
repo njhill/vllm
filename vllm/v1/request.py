@@ -160,6 +160,9 @@ class Request:
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
+        # Number of in-flight steps that added to num_output_placeholders. Each
+        # is sure to produce at least one token.
+        self.num_output_placeholder_steps = 0
         # Tokens of output in flight when the request was preempted: delivered
         # on return, but must not mutate the reset counters.
         self.num_stale_output_tokens = 0
