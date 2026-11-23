@@ -448,6 +448,7 @@ class GroupCoordinator:
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
     cpu_group: ProcessGroup  # group for CPU communication
+    cpu_group_is_ucc: bool = False  # cpu_group runs on UCC, not gloo
     device_group: ProcessGroup  # group for device communication
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
@@ -485,6 +486,7 @@ class GroupCoordinator:
         )
 
         self.cpu_timeout = get_cpu_distributed_timeout_or_none()
+        self.cpu_group_is_ucc = cpu_backend != "gloo"
 
         # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
         # codepath. Default (False) preserves the legacy ``new_group`` path.
@@ -1403,6 +1405,10 @@ class GroupCoordinator:
 
     def cpu_all_reduce_(self, tensor: torch.Tensor) -> torch.Tensor:
         """In-place SUM all-reduce of a small CPU tensor over `cpu_group`."""
+        if self.cpu_group_is_ucc:
+            # UCC applies the group's timeout (cpu_timeout) to each collective.
+            self.cpu_group.allreduce([tensor]).wait()
+            return tensor
         return cpu_all_reduce_(tensor, self.cpu_group, self.cpu_timeout)
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
