@@ -934,7 +934,6 @@ def test_hisparse_hot_transition_reclaims_pages_before_next_prefill_chunk():
     gross_budget = 2 + 4 * num_resident_groups
     assert 2 * num_resident_groups <= free < gross_budget
     reclaimable = (4 - len(shared_pages)) * num_resident_groups
-    assert coordinator.get_num_reclaimable_blocks(request.request_id) == reclaimable
 
     blocks = manager.allocate_slots(request, 2 * HISPARSE_BLOCK_SIZE)
 
@@ -981,9 +980,6 @@ def test_hisparse_reclaim_must_fund_full_sequence(shared_pages, admitted):
     for hot in coordinator.hot_managers:
         hot.require_hot(request.request_id)
     assert manager.block_pool.get_num_free_blocks() == 10
-    assert coordinator.get_num_reclaimable_blocks(request.request_id) == 12 - 3 * len(
-        shared_pages
-    )
 
     blocks = manager.allocate_slots(
         request, 2 * HISPARSE_BLOCK_SIZE, full_sequence_must_fit=True

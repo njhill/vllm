@@ -486,27 +486,17 @@ class HiSparseCoordinator:
         for hot_manager in self.hot_managers:
             hot_manager.require_hot(request_id)
 
-    def get_num_reclaimable_blocks(self, request_id: str) -> int:
-        """Clean resident blocks a hot-first allocation can release immediately."""
-        state = self.request_states.get(request_id)
-        if state is None:
-            return 0
-        return sum(
-            block.ref_cnt == 1
-            for _, blocks in self._iter_unpinnable_pages(
-                request_id, state, state.pinned_clean
-            )
-            for block in blocks
-        )
-
-    def try_preallocate_hot(
-        self,
-        request_id: str,
-        shortfall: int,
-        available: int,
+    def try_reclaim_for_hot(
+        self, request_id: str, shortfall: int, available: int
     ) -> bool:
-        """Fund this allocation only if Hot fits and reclaim covers the shortfall."""
-        if not self.resident_managers:
+        """Fund this allocation only if Hot fits and reclaim covers the shortfall.
+
+        Clean pages are unpinned before Hot exists. That is safe because the
+        caller allocates Hot in the same `allocate_slots` call, before the
+        worker sees the step.
+        """
+        state = self.request_states.get(request_id)
+        if state is None or not self.resident_managers:
             return False
         upfront = 0
         for manager in self.hot_managers:
@@ -518,11 +508,18 @@ class HiSparseCoordinator:
                 shortfall += missing
         if not upfront or upfront > available:
             return False
-        if self.get_num_reclaimable_blocks(request_id) < shortfall:
+        reclaimable = sum(
+            block.ref_cnt == 1
+            for _, blocks in self._iter_unpinnable_pages(
+                request_id, state, state.pinned_clean
+            )
+            for block in blocks
+        )
+        if reclaimable < shortfall:
             return False
         for manager in self.hot_managers:
-            manager.preallocate(request_id)
-        self.update_residency(request_id)
+            manager.require_hot(request_id)
+        self._unpin_clean_pages(request_id, state)
         return True
 
     def update_residency(self, request_id: str) -> None:
@@ -1149,5 +1146,5 @@ def get_hisparse_coordinator(
     )
     if coordinator.host_manager is None:
         raise ValueError("No HiSparse cache group is configured.")
-    kv_cache_manager.reclaim_blocks = coordinator.try_preallocate_hot
+    kv_cache_manager.reclaim_blocks = coordinator.try_reclaim_for_hot
     return coordinator

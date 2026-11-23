@@ -198,9 +198,8 @@ class KVCacheManager:
         self.block_pool = self.coordinator.block_pool
         # Optional `reclaim_blocks(request_id, deficit, budget)`, called when an
         # allocation is `deficit` blocks short. It may free blocks, and may
-        # allocate up to `budget` free blocks to the request that its managers
-        # report in this allocation. It returns True only if the allocation can
-        # now proceed, and changes nothing otherwise.
+        # raise this request's need by at most `budget` blocks. It returns True
+        # only if the allocation can now proceed, and changes nothing otherwise.
         self.reclaim_blocks: Callable[[str, int, int], bool] | None = None
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
