@@ -400,9 +400,8 @@ RUN set -eux; \
                 --without-cuda --without-rocm \
             && make -j"${max_jobs}" && make install; \
         rm -rf /tmp/ucx /tmp/ucc; \
-        mkdir -p /ucc-dist/opt /ucc-dist/etc/ld.so.conf.d; \
+        mkdir -p /ucc-dist/opt; \
         cp -a /opt/ucx /opt/ucc /ucc-dist/opt/; \
-        printf "/opt/ucx/lib\n/opt/ucc/lib\n" > /ucc-dist/etc/ld.so.conf.d/ucc.conf; \
     fi
 #################### UCC BUILD IMAGE ####################
 
@@ -861,9 +860,10 @@ RUN apt-get update -y \
     && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
 
-# UCX/UCC runtime libraries for vllm._ucc_C (nothing unless INSTALL_UCC=true)
+# UCX/UCC runtime libraries for vllm._ucc_C (nothing unless INSTALL_UCC=true).
+# Found via RUNPATH (_ucc_C -> /opt/ucc/lib -> /opt/ucx/lib), not ldconfig, so
+# they don't become the default libucp/libucs for anything else in the image.
 COPY --from=ucc-build /ucc-dist/ /
-RUN if [ -f /etc/ld.so.conf.d/ucc.conf ]; then ldconfig; fi
 
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
