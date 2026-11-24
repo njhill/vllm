@@ -12,6 +12,7 @@ from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     retained_objects,
+    skips_aux_outputs,
 )
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
@@ -2609,8 +2610,7 @@ class Scheduler(SchedulerInterface):
                 if (
                     new_token_ids
                     and sampling_masks is not None
-                    and request.sampling_params is not None
-                    and request.sampling_params.return_aux_outputs
+                    and not skips_aux_outputs(request)
                 ):
                     new_sampling_mask = sampling_masks.slice_request(
                         req_index, len(new_token_ids)

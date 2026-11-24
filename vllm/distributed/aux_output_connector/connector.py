@@ -72,6 +72,12 @@ def aux_output_cache_salt(
     return _AUX_SALT_PREFIX + json.dumps(salt, sort_keys=True)
 
 
+def skips_aux_outputs(request: Request) -> bool:
+    """Whether the request opted out of auxiliary outputs."""
+    params = request.sampling_params
+    return params is not None and not params.return_aux_outputs
+
+
 def salt_aux_outputs(request: EngineCoreRequest) -> None:
     """Apply aux_output_cache_salt to a request entering an engine that records
     auxiliary outputs. Frontend prompt hashes do not include a changed salt, so
@@ -152,7 +158,7 @@ class AuxOutputSchedulerConnector:
         block_hashes_by_request: dict[str, PackedBlockHashes] = {}
         for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             request = requests[request_id]
-            if self._skips(request):
+            if skips_aux_outputs(request):
                 continue
             self._sent_hash_counts.setdefault(request_id, 0)
             self._computed_from.setdefault(request_id, request.num_computed_tokens)
@@ -204,7 +210,7 @@ class AuxOutputSchedulerConnector:
         )
 
     def max_cache_hit(self, request: Request) -> int:
-        if self._skips(request):
+        if skips_aux_outputs(request):
             return request.num_tokens - 1
         num_blocks = 0
         for block, keys in self._kv_blocks(request.block_hashes):
@@ -220,7 +226,7 @@ class AuxOutputSchedulerConnector:
     def cap_external_hit(
         self, request: Request, num_local: int, num_external: int
     ) -> int:
-        if self._skips(request):
+        if skips_aux_outputs(request):
             return num_external
         num_hit = num_local + num_external
         if num_hit <= self._emit_start(request):
@@ -236,7 +242,7 @@ class AuxOutputSchedulerConnector:
         return num_external
 
     def request_loading(self, request: Request, num_tokens: int) -> None:
-        if self._skips(request):
+        if skips_aux_outputs(request):
             return
         blocks = islice(
             self._kv_blocks(request.block_hashes), cdiv(num_tokens, self._block_size)
@@ -279,7 +285,7 @@ class AuxOutputSchedulerConnector:
         output: dict[str, AuxRequestOutput] | None,
     ) -> np.ndarray | None:
         """Return the accepted R3 rows for one scheduled request."""
-        if self._skips(request):
+        if skips_aux_outputs(request):
             return None
         request_id = request.request_id
         # The block this request started mid-block has no rows here. Its hash
@@ -320,7 +326,7 @@ class AuxOutputSchedulerConnector:
 
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""
-        if self._skips(request):
+        if skips_aux_outputs(request):
             return
         request_id = request.request_id
         self._loading.pop(request_id, None)
@@ -344,11 +350,6 @@ class AuxOutputSchedulerConnector:
                 self._kv_cached[block] = keys
                 self._retained_hashes.extend(keys)
         self._release_unheld()
-
-    @staticmethod
-    def _skips(request: Request) -> bool:
-        params = request.sampling_params
-        return params is not None and not params.return_aux_outputs
 
     @staticmethod
     def _pack_hashes(hashes: Sequence[bytes]) -> PackedBlockHashes | None:
